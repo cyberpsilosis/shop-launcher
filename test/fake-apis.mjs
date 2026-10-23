@@ -66,7 +66,7 @@ export async function startFakes(state = newState()) {
         const secret = 'sb_secret_' + rnd(16);
         state.issued.push(secret);
         s.keys[ref] = [
-          { name: 'anon', type: 'legacy', api_key: 'eyJhbGciOiJIUzI1NiJ9.' + rnd(10) + '.' + rnd(10) },
+          { name: 'anon', type: 'legacy', api_key: 'fake-anon-' + rnd(10) },
           { name: 'default', type: 'secret', api_key: secret },
         ];
         return send(201, { ...proj });
