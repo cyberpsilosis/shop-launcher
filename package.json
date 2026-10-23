@@ -1,0 +1,15 @@
+{
+  "name": "shop-launcher",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Takes a shop live: find-or-create its Supabase project, Resend key, Stripe webhook and Cloudflare secrets.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check:triggers": "node scripts/check-triggers.mjs .github/workflows"
+  },
+  "devDependencies": {
+    "yaml": "2.8.1"
+  }
+}
