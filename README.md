@@ -70,15 +70,21 @@ takes about a minute, most of it the runner download.
 What the script does (`scripts/add-launcher-runner.sh`):
 
 - Stops with `STOP: ...; nothing changed` if the `ci-shop-launcher` user or
-  its home exists, if a shop-launcher runner service is installed, or if any
-  runner folder under `/home` is already registered to this repository. It
-  never uses `--replace`, so it cannot take over another runner.
+  its home exists, if a shop-launcher runner service is installed, or if a
+  runner already registered to this repository is anywhere on the Linux disk
+  or in the folder of any installed runner service. The repository address
+  matches with or without a trailing `/` or `.git`. It only reads those
+  files. It never uses `--replace`, so it cannot take over another runner.
+  The first run walks the whole Linux disk (not the Windows drives under
+  `/mnt`), which can take up to half a minute.
 - Makes user `ci-shop-launcher`: its own group only, no password, no sudo,
   home mode 750. The other runners' users cannot read its folder.
 - Downloads GitHub's runner, checks its published SHA-256, and puts it in
   `/home/ci-shop-launcher/actions-runner`.
 - Registers it as `laptop-shop-launcher`, label `shop-launcher`, and starts
-  it as a systemd service running as that user.
+  it as a systemd service running as that user. The token goes to GitHub's
+  `config.sh` through its environment (`ACTIONS_RUNNER_INPUT_TOKEN`), never
+  on a command line, so `ps` cannot show it to another user.
 
 When it ends with `Done: runner laptop-shop-launcher (label shop-launcher)
 runs as ci-shop-launcher.`, the runner shows as Idle under Settings > Actions

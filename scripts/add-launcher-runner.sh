@@ -16,16 +16,26 @@
 #
 # It never touches another runner, user or service. It stops before
 # changing anything if the ci-shop-launcher user or its home exists, if a
-# shop-launcher runner service exists, or if any folder under /home already
-# holds a runner registered to shop-launcher. It never uses --replace.
+# shop-launcher runner service exists, or if a runner already registered to
+# shop-launcher is found anywhere on the Linux disk (every local folder
+# except /proc, /sys, /dev, /run and the Windows drives under /mnt) or in
+# the folder of any installed runner service. The repository URL in a
+# .runner file matches with or without a trailing slash or .git. It only
+# reads those files. It never uses --replace.
 #
 # What it makes:
 #   - user ci-shop-launcher: own group only, no password, no sudo, home 750
 #   - GitHub's runner in /home/ci-shop-launcher/actions-runner, checked
 #     against its published SHA-256, name laptop-shop-launcher, label
 #     shop-launcher, as a systemd service running as ci-shop-launcher
-# The registration token lives only in this script's memory and is passed
-# to config.sh on stdin's side of a pipe; nothing writes it to disk.
+# The registration token never appears in a command line, so `ps` and
+# /proc/<pid>/cmdline never show it to another user. It reaches the runner
+# user's shell through a pipe and config.sh through the environment
+# variable ACTIONS_RUNNER_INPUT_TOKEN, which the runner reads, masks in its
+# logs and removes from its environment. While config.sh runs (a few
+# seconds), only root and ci-shop-launcher can read that environment
+# (/proc/<pid>/environ is private to its owner). Nothing writes the token
+# to disk.
 #
 # LAUNCHER_RUNNER_NO_REGISTER=1 makes the user and the empty runner folder
 # and stops: no token, no download, no registration, no service. For trying
@@ -67,13 +77,29 @@ getent passwd "$U" >/dev/null && die "user $U already exists; nothing changed"
 if compgen -G "${UNIT_DIR}/${UNIT_GLOB}" >/dev/null; then
   die "a shop-launcher runner service already exists in ${UNIT_DIR}; nothing changed"
 fi
-# Another user may already run this repository's runner. Read the .runner
-# files under /home (read only, two folders deep) and stop if one is ours.
+# Another user may already run this repository's runner, in any folder.
+# Read every .runner file on the Linux disk and in each installed runner
+# service's folder (read only) and stop if one is ours. -xdev keeps find on
+# local disks, so the Windows drives under /mnt are not walked.
+SCAN_ROOT="${LAUNCHER_RUNNER_SCAN_ROOT:-/}" # tests only
+OURS="github\.com/${OWNER_REPO//./\\.}(\.git)?/*\""
+runner_files() {
+  find "$SCAN_ROOT" "$HOME_BASE" -xdev \
+    \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /mnt \
+       -o -name _work -o -name node_modules -o -name .git \) -prune \
+    -o -name .runner -type f -print0 2>/dev/null || true
+  for u in "${UNIT_DIR}"/actions.runner.*.service; do
+    [ -f "$u" ] || continue
+    d="$(sed -n 's/^WorkingDirectory=//p' "$u" | head -1)"
+    [ -n "$d" ] && [ -f "$d/.runner" ] && printf '%s\0' "$d/.runner"
+  done
+  return 0
+}
 while IFS= read -r -d '' f; do
-  if grep -qi "github.com/${OWNER_REPO}\"" "$f" 2>/dev/null; then
+  if grep -Eqi -- "$OURS" "$f" 2>/dev/null; then
     die "$f is already registered to ${OWNER_REPO}; nothing changed"
   fi
-done < <(find "$HOME_BASE" -mindepth 2 -maxdepth 3 -name .runner -type f -print0 2>/dev/null)
+done < <(runner_files)
 case "$(uname -m)" in
   x86_64) ARCH=x64 ;;
   aarch64|arm64) ARCH=arm64 ;;
@@ -131,8 +157,9 @@ chown -R "$U:$U" "$DIR"
 echo "    runner ${VERSION} (${ARCH}) in ${DIR}"
 
 echo "== register ${NAME} (label ${LABEL}) with ${REPO_URL}"
+# printf and export are shell builtins, so the token is in no argv.
 printf '%s' "$TOKEN" | sudo -u "$U" bash -c \
-  'T="$(cat)"; cd "$1" && ./config.sh --unattended --url "$2" --token "$T" --name "$3" --labels "$4" --work _work' \
+  'export ACTIONS_RUNNER_INPUT_TOKEN="$(cat)"; cd "$1" && ./config.sh --unattended --url "$2" --name "$3" --labels "$4" --work _work' \
   _ "$DIR" "$REPO_URL" "$NAME" "$LABEL"
 TOKEN=""
 (cd "$DIR" && ./svc.sh install "$U" && ./svc.sh start)
