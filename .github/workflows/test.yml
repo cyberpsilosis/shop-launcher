@@ -1,0 +1,23 @@
+# The launcher's own tests. push only: a fork's push runs in the fork, so no
+# stranger can start this job on Elijah's laptop. Never add pull_request.
+name: test
+
+on:
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: [self-hosted, shop-launcher]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Fork guard
+        run: node scripts/check-triggers.mjs .github/workflows
+      - run: npm test
