@@ -4,9 +4,28 @@
   "repo": "cyberpsilosis/orb-shop",
   "worker": "orb-shop",
   "siteUrl": "https://orb-shop.elijahedington.workers.dev",
-  "supabase": { "region": "us-west-1" },
-  "resend": { "domainId": null },
-  "install": ["npm", "ci"],
-  "build": ["npm", "run", "build"],
-  "deploy": ["npx", "--no-install", "wrangler", "deploy"]
+  "supabase": {
+    "region": "us-west-1"
+  },
+  "resend": {
+    "domainId": null
+  },
+  "install": [
+    "npm",
+    "ci"
+  ],
+  "build": [
+    "npm",
+    "run",
+    "build"
+  ],
+  "deploy": [
+    "npx",
+    "--no-install",
+    "wrangler",
+    "deploy"
+  ],
+  "smoke": {
+    "product": "orb"
+  }
 }

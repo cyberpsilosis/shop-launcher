@@ -30,8 +30,15 @@ export function apiBases(env) {
     stripe: 'https://api.stripe.com',
     cloudflare: 'https://api.cloudflare.com/client/v4',
   };
+  // The shop's own database API (PostgREST), read by the smoke with the service key.
+  bases.supabaseRest = (ref) => `https://${ref}.supabase.co`;
+  if (env.LAUNCHER_FAKE_APIS === '1' && env.SUPABASE_REST_URL) {
+    const o = env.SUPABASE_REST_URL;
+    if (!FAKE_HOST.test(o)) throw new Error('SUPABASE_REST_URL may only point at 127.0.0.1 or localhost');
+    bases.supabaseRest = () => o.replace(/\/$/, '');
+  }
   if (env.LAUNCHER_FAKE_APIS === '1') {
-    for (const k of Object.keys(bases)) {
+    for (const k of ['supabase', 'resend', 'stripe', 'cloudflare']) {
       const o = env[`${k.toUpperCase()}_API_URL`];
       if (o) {
         if (!FAKE_HOST.test(o)) throw new Error(`${k.toUpperCase()}_API_URL may only point at 127.0.0.1 or localhost`);

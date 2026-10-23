@@ -11,9 +11,10 @@ import { fileURLToPath } from 'node:url';
 import { createLog } from './log.mjs';
 import { createHttp, apiBases, HttpError, PlanWriteRefused } from './http.mjs';
 import { supabase, resend, stripe, cloudflare, WEBHOOK_EVENTS } from './providers.mjs';
+import { runSmoke, CHECKS } from './smoke.mjs';
 
-export const MODES = ['plan', 'apply'];
-export const LATER_MODES = { smoke: 'piece 2', live: 'piece 3', rollback: 'piece 3' };
+export const MODES = ['plan', 'apply', 'smoke'];
+export const LATER_MODES = { live: 'piece 3', rollback: 'piece 3' };
 export const SLUG = /^[a-z][a-z0-9]{1,30}$/;
 export const TOKENS = ['SUPABASE_ACCESS_TOKEN', 'RESEND_ADMIN_KEY', 'STRIPE_SECRET_KEY', 'CLOUDFLARE_API_TOKEN'];
 export const VARIABLES = ['SUPABASE_ORG_ID', 'CLOUDFLARE_ACCOUNT_ID'];
@@ -107,6 +108,11 @@ export async function run(opts) {
     pollMs = 5000,
     pollTries = 120,
     now = () => new Date(),
+    browser,
+    expectCommit,
+    runId,
+    smokeSleep,
+    smokeTries,
   } = opts;
 
   const summary = {
@@ -121,6 +127,8 @@ export async function run(opts) {
     secrets: [],
     warnings: [],
     missingPermissions: [],
+    checks: [],
+    rollback: null,
     errors: [],
   };
   let http;
@@ -128,9 +136,9 @@ export async function run(opts) {
 
   try {
     if (mode in LATER_MODES) {
-      throw new UsageError(`mode "${mode}" is not built yet: it arrives with ${LATER_MODES[mode]} of the launcher. Use plan or apply.`);
+      throw new UsageError(`mode "${mode}" is not built yet: it arrives with ${LATER_MODES[mode]} of the launcher. Use plan, apply or smoke.`);
     }
-    if (!MODES.includes(mode)) throw new UsageError(`mode must be plan or apply`);
+    if (!MODES.includes(mode)) throw new UsageError(`mode must be plan, apply or smoke`);
     if (!SLUG.test(shop || '')) throw new UsageError('shop must be 2 to 31 lowercase letters or digits, starting with a letter');
     if (!shopConfig || shopConfig.slug !== shop) throw new UsageError(`shops/${shop}.json is missing or names another slug`);
 
@@ -186,6 +194,11 @@ export async function run(opts) {
       }
     };
 
+    const siteUrl = () => {
+      const o = env.LAUNCHER_FAKE_APIS === '1' && env.SHOP_SITE_URL;
+      if (o && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(o)) throw new UsageError('SHOP_SITE_URL may only point at localhost');
+      return (o || shopConfig.siteUrl).replace(/\/$/, '');
+    };
     const projectName = `shop-${shop}`;
     const keyName = `shop-${shop}`;
     const webhookUrl = `${shopConfig.siteUrl.replace(/\/$/, '')}/api/stripe/webhook`;
@@ -241,6 +254,17 @@ export async function run(opts) {
     if (blocked.length) {
       for (const b of blocked) summary.errors.push(`${b.kind}: ${b.message}`);
       throw new Error(`could not read ${blocked.map((b) => b.kind).join(', ')}; ${mode === 'apply' ? 'apply stopped before its first write' : 'plan is incomplete'}`);
+    }
+
+    if (mode === 'smoke') {
+      // Smoke: deploy the shop's main as it is (no secret changes), then the seven checks.
+      const prev = await recordActive();
+      await deploy(null);
+      const green = await smokeOrRollback(prev);
+      if (green) await retireOldKeys();
+      summary.ok = green;
+      exitCode = green ? 0 : 1;
+      return summary;
     }
 
     if (mode === 'plan') {
@@ -309,6 +333,7 @@ export async function run(opts) {
       log.mask(values.CRON_SECRET);
     }
 
+    const prev = Object.keys(values).length ? await recordActive() : null;
     if (Object.keys(values).length) {
       try {
         await deploy(values);
@@ -321,28 +346,95 @@ export async function run(opts) {
       }
     }
 
+    // A rotation leaves the old key and webhook in place: they are deleted only
+    // after a green smoke on the new version (apply runs it now when it can).
+    if (oldKeys.length || oldEndpoints.length) {
+      log.info(`kept     ${oldKeys.length} old Resend key(s), ${oldEndpoints.length} old Stripe webhook(s) until a green smoke`);
+      summary.oldKept = { resend_key: oldKeys.length, stripe_webhook: oldEndpoints.length };
+      if (browser) {
+        const green = await smokeOrRollback(prev);
+        if (!green) {
+          if (madeNow.key) await rs.deleteKey(madeNow.key).catch(() => log.warn('could not remove the new Resend key'));
+          if (madeNow.endpoint) await st.deleteEndpoint(madeNow.endpoint).catch(() => log.warn('could not remove the new Stripe webhook'));
+          return summary;
+        }
+        await retireOldKeys();
+      }
+    }
+
+    summary.ok = true;
+    exitCode = 0;
+    return summary;
+
+    // ---- helpers for deploy, smoke and rollback ------------------------------
     async function deploy(values) {
-      writeSecretsFile(secretsFile, values);
+      if (values) writeSecretsFile(secretsFile, values);
       const fake = env.LAUNCHER_FAKE_APIS === '1' && deployCmd;
       const cmds = fake
         ? [deployCmd]
         : [...(shopConfig.install ? [shopConfig.install] : []), ...(shopConfig.build ? [shopConfig.build] : []), shopConfig.deploy];
+      // The shop's /api/version reports the commit Workers Builds would set.
+      const build = expectCommit ? { WORKERS_CI_COMMIT_SHA: expectCommit, WORKERS_CI_BRANCH: 'main' } : {};
       for (let i = 0; i < cmds.length; i++) {
         const last = i === cmds.length - 1;
-        const cmd = last ? [...cmds[i], '--secrets-file', secretsFile] : cmds[i];
-        const extra = last ? { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID } : {};
+        const cmd = last && values ? [...cmds[i], '--secrets-file', secretsFile] : cmds[i];
+        const extra = last ? { ...build, CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID } : build;
         log.info(`running  ${cmd.slice(0, 3).join(' ')}`);
         await runCommand(cmd, { cwd: shopDir, env: childEnv(env, extra), log });
       }
     }
 
-    // Old keys go only after the new ones are on the Worker.
-    for (const id of oldKeys) await rs.deleteKey(id);
-    for (const id of oldEndpoints) await st.deleteEndpoint(id);
+    // Before any deploy: the version that is live now, and the commit it reports.
+    async function recordActive() {
+      const id = await cf.activeVersion(shopConfig.worker);
+      log.mask(id);
+      const v = await fetch(`${siteUrl()}/api/version`).then((r) => r.json()).catch(() => null);
+      const rec = { id, commit: v?.commit || null };
+      log.info(`recorded the live Worker version (${rec.commit ? rec.commit.slice(0, 7) : 'no commit'}) before deploy`);
+      return rec;
+    }
 
-    summary.ok = true;
-    exitCode = 0;
-    return summary;
+    async function smokeOrRollback(prev) {
+      if (!browser) throw new Error('smoke needs a browser (Playwright)');
+      summary.checks = await runSmoke({
+        http, bases, env, shopConfig: { ...shopConfig, siteUrl: siteUrl() }, expectCommit, browser, sb, supabaseRef: ref, log, runId,
+        sleep: smokeSleep, tries: smokeTries,
+      });
+      for (const c of summary.checks) log.info(`${c.ok ? 'pass' : c.skipped ? 'skip' : 'FAIL'}     ${c.title}: ${c.detail}`);
+      const green = summary.checks.length === CHECKS.length && summary.checks.every((c) => c.ok);
+      if (green) return true;
+      const failed = summary.checks.find((c) => !c.ok && !c.skipped);
+      summary.errors.push(`smoke failed at "${failed.title}": ${failed.detail}`);
+      if (!prev?.id) {
+        summary.rollback = { ok: false, detail: 'no earlier version to roll back to' };
+        return false;
+      }
+      const fake = env.LAUNCHER_FAKE_APIS === '1' && deployCmd;
+      const cmd = fake
+        ? [...deployCmd, 'rollback', prev.id]
+        : ['npx', '--no-install', 'wrangler', 'rollback', prev.id, '--name', shopConfig.worker, '--message', `shop-launcher smoke failed ${runId || ''}`.trim()];
+      try {
+        log.info('running  wrangler rollback to the recorded version');
+        await runCommand(cmd, { cwd: shopDir, env: childEnv(env, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID }), log });
+        const v = await fetch(`${siteUrl()}/api/version`).then((r) => r.json()).catch(() => null);
+        const back = !prev.commit || v?.commit === prev.commit;
+        summary.rollback = { ok: back, to: '***', commit: v?.commit ? v.commit.slice(0, 7) : null, detail: back ? `rolled back; /api/version is ${String(v?.commit).slice(0, 7)} again` : `rolled back, but /api/version says ${String(v?.commit).slice(0, 7)}` };
+      } catch (e) {
+        summary.rollback = { ok: false, detail: `wrangler rollback failed: ${log.redact(e.message)}` };
+      }
+      return false;
+    }
+
+    // After a green smoke: every Resend key and Stripe webhook of this shop but
+    // the newest (the one on the Worker) is an old one. Delete those.
+    async function retireOldKeys() {
+      const ks = (await rs.findKeys(keyName)).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+      const es = (await st.findEndpoints(webhookUrl, shop)).sort((a, b) => (b.created || 0) - (a.created || 0));
+      for (const k of ks.slice(1)) await rs.deleteKey(k.id);
+      for (const e of es.slice(1)) await st.deleteEndpoint(e.id);
+      if (ks.length > 1 || es.length > 1) log.info(`deleted  ${Math.max(0, ks.length - 1)} old Resend key(s), ${Math.max(0, es.length - 1)} old Stripe webhook(s) after the green smoke`);
+      summary.retired = { resend_key: Math.max(0, ks.length - 1), stripe_webhook: Math.max(0, es.length - 1) };
+    }
   } catch (e) {
     if (e instanceof UsageError) exitCode = 2;
     const msg = e instanceof PlanWriteRefused ? `BUG: ${e.message}` : e.message;
@@ -373,6 +465,12 @@ export function markdown(s) {
     for (const x of s.secrets) out.push(`| ${x.name} | ${x.state} |`);
     out.push('');
   }
+  if (s.checks?.length) {
+    out.push(`Smoke: ${s.checks.filter((c) => c.ok).length} of ${s.checks.length} passed`, '', '| # | Check | Result | Why |', '|---|---|---|---|');
+    s.checks.forEach((c, i) => out.push(`| ${i + 1} | ${c.title} | ${c.ok ? 'pass' : c.skipped ? 'not run' : 'FAIL'} | ${c.detail} |`));
+    out.push('');
+  }
+  if (s.rollback) out.push(`- Rollback: ${s.rollback.detail}`);
   for (const w of s.warnings) out.push(`- Token ${w.token}: ${w.daysLeft !== undefined ? `expires ${w.expiresOn}, ${w.daysLeft} days left` : w.status}`);
   for (const m of s.missingPermissions) out.push(`- Missing ${m.provider} permission: ${m.permission}`);
   for (const e of s.errors) out.push(`- Error: ${e}`);
@@ -380,6 +478,18 @@ export function markdown(s) {
 }
 
 // ---- CLI --------------------------------------------------------------------
+// Tests only (LAUNCHER_FAKE_APIS=1): the fake shop's own "Checkout".
+function fakeBrowser() {
+  return {
+    async pay({ productUrl, email }) {
+      const site = productUrl.replace(/\/shop\/.*$/, '');
+      if (!/^http:\/\/(127\.0\.0\.1|localhost)/.test(site)) throw new Error('fake browser is for localhost only');
+      const r = await fetch(`${site}/__fake_pay`, { method: 'POST', body: JSON.stringify({ email }) });
+      return r.json();
+    },
+  };
+}
+
 function parseArgs(argv) {
   const a = {};
   for (let i = 0; i < argv.length; i++) {
@@ -410,6 +520,15 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     stepSummary: process.env.GITHUB_STEP_SUMMARY,
     deployCmd: fake && args['deploy-cmd'] ? args['deploy-cmd'].split(' ') : undefined,
     pollMs: fake ? 0 : 5000,
+    expectCommit: args['expect-commit'],
+    runId: process.env.GITHUB_RUN_ID,
+    smokeSleep: fake ? async () => {} : undefined,
+    browser:
+      args.mode === 'smoke' || (args.mode === 'apply' && args.browser)
+        ? fake && args.browser === 'fake'
+          ? fakeBrowser()
+          : (await import('./checkout-browser.mjs')).playwrightBrowser()
+        : undefined,
   });
   process.exitCode = summary.exitCode;
 }

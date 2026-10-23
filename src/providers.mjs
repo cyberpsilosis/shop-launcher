@@ -100,6 +100,14 @@ export function cloudflare(http, base, env) {
       if (status === 404) return { exists: false, names: new Set() };
       return { exists: true, names: new Set((data?.result || []).map((s) => s.name)) };
     },
+    // The version serving 100% now (or the largest share), from the latest deployment.
+    async activeVersion(worker) {
+      const { status, data } = await req(`/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${worker}/deployments`, { allow: [404] });
+      if (status === 404) return null;
+      const d = (data?.result?.deployments || [])[0];
+      const v = [...(d?.versions || [])].sort((a, b) => (b.percentage || 0) - (a.percentage || 0))[0];
+      return v?.version_id || null;
+    },
     async tokenExpiry() {
       const { data } = await req('/user/tokens/verify');
       return { status: data?.result?.status, expiresOn: data?.result?.expires_on || null };

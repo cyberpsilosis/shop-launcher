@@ -25,12 +25,32 @@ dispatch op (piece 5) will do the same thing.
   (14 days ahead), and any missing Supabase permission by name.
 - **apply**: does what plan printed. Run it twice and the second run is all
   `skip` with zero write calls.
-- **smoke**, **live**, **rollback**: refused with a message. They are pieces
-  2 and 3.
+- **smoke**: records the live Worker version and the commit `/api/version`
+  reports, deploys the shop's `main`, then runs seven checks on Stripe test
+  keys: (1) `/`, `/shop/<product>`, `/start`, `/returns` answer 200 and
+  `/api/version` equals main; (2) Playwright pays on Stripe's test Checkout
+  with 4242 4242 4242 4242 as `delivered@resend.dev` (Resend's test inbox, no
+  person); (3) Stripe's event for that session has `pending_webhooks` 0 (every
+  endpoint answered 2xx), cross-checked by the shop's order row; (4) one
+  session in `orders`; (5) `alert_email_at` set and Resend holds the "New
+  order" email linking to that order; (6) the Add tracking link opens and
+  saves `LP00123456789CN`, `shipped_email_at` set; (7) Stripe refunds the
+  payment and the row becomes `refunded` with `supplier_order_ref` "test:
+  shop-launcher smoke <run>". On any fail it runs `wrangler rollback <recorded
+  id>` and checks `/api/version` is the earlier commit; a paid test is still
+  refunded. Only after a green smoke are old Resend keys and Stripe webhooks
+  (all but the newest) deleted. The job page shows one line per check.
+- **live**, **rollback**: refused with a message. They are piece 3.
+
+The smoke needs the shop's Stripe test key to allow, beyond piece 1's list:
+Checkout Sessions read, Events read, Refunds write. It reads the orders table
+through the shop's own database API with the service key (revealed as in
+apply), and Resend's sent emails with `RESEND_ADMIN_KEY`.
 
 `rotate` means a secret that cannot be read back (a Stripe webhook secret,
-a Resend key) is missing from the Worker. apply makes a new one, puts it on
-the Worker, and only then deletes the old one. If the deploy fails, apply
+a Resend key) is missing from the Worker. apply makes a new one and puts it
+on the Worker; the old one stays until a green smoke (apply runs the smoke
+itself when started with `--browser`). If the deploy fails, apply
 deletes what it just made, so a failed run leaves the accounts as they were.
 
 The job runs on the laptop runner (`[self-hosted, shop-launcher]`). A launch
