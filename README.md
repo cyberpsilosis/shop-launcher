@@ -48,9 +48,49 @@ cancels a queued one. GitHub drops a job that waits more than 24 hours.
   `SUPABASE_ACCESS_TOKEN_EXPIRES_ON` and `RESEND_ADMIN_KEY_EXPIRES_ON` (ISO
   dates) so plan can warn before those tokens expire. Cloudflare's expiry is
   read from Cloudflare itself.
-- The runner, label `shop-launcher` (piece 10).
+- The runner, label `shop-launcher`: one command, below.
 - Settings > Actions > General: "Require approval for all external
   contributors".
+
+## Add the runner (once, on the laptop)
+
+Every job here runs on `[self-hosted, shop-launcher]`, so nothing runs until
+this runner exists. Open Windows PowerShell on the laptop and paste this one
+line:
+
+```powershell
+gh api -X POST repos/cyberpsilosis/shop-launcher/actions/runners/registration-token --jq .token | wsl -u root -- bash -c 'curl -fsSLo /tmp/add-launcher-runner.sh https://raw.githubusercontent.com/cyberpsilosis/shop-launcher/main/scripts/add-launcher-runner.sh && bash /tmp/add-launcher-runner.sh'
+```
+
+It asks you nothing. `gh` makes a registration token (valid one hour) and
+pipes it straight into the script, so the token is never shown, copied or
+saved. `wsl -u root` runs the script as root without a password prompt. It
+takes about a minute, most of it the runner download.
+
+What the script does (`scripts/add-launcher-runner.sh`):
+
+- Stops with `STOP: ...; nothing changed` if the `ci-shop-launcher` user or
+  its home exists, if a shop-launcher runner service is installed, or if any
+  runner folder under `/home` is already registered to this repository. It
+  never uses `--replace`, so it cannot take over another runner.
+- Makes user `ci-shop-launcher`: its own group only, no password, no sudo,
+  home mode 750. The other runners' users cannot read its folder.
+- Downloads GitHub's runner, checks its published SHA-256, and puts it in
+  `/home/ci-shop-launcher/actions-runner`.
+- Registers it as `laptop-shop-launcher`, label `shop-launcher`, and starts
+  it as a systemd service running as that user.
+
+When it ends with `Done: runner laptop-shop-launcher (label shop-launcher)
+runs as ci-shop-launcher.`, the runner shows as Idle under Settings > Actions
+> Runners, and the queued `test` runs start.
+
+To try it on a scratch machine without registering anything:
+`sudo LAUNCHER_RUNNER_NO_REGISTER=1 bash scripts/add-launcher-runner.sh`. It
+makes the user and the empty runner folder and stops.
+
+To undo: in `/home/ci-shop-launcher/actions-runner` run `sudo ./svc.sh stop`
+and `sudo ./svc.sh uninstall`, delete the runner under Settings > Actions >
+Runners, then `sudo userdel -r ci-shop-launcher`.
 
 ## Can a stranger reach the laptop?
 
@@ -98,7 +138,7 @@ and the test that proves it:
 
 What stays: anyone Elijah gives push access to can run code on that runner,
 as in his other repositories. The runner is its own Linux user with no sudo
-(piece 10) and holds no token at rest.
+(`scripts/add-launcher-runner.sh`) and holds no provider token at rest.
 
 ## Summary JSON (read by the store op, piece 5)
 
