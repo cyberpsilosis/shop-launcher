@@ -5,6 +5,7 @@
   "worker": "orb-shop",
   "siteUrl": "https://orb-shop.elijahedington.workers.dev",
   "keepExisting": true,
+  "storage": "d1",
   "supabase": {
     "region": "us-west-1"
   },

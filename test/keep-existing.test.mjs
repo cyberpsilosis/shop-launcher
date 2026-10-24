@@ -19,7 +19,10 @@ import { createLog } from '../src/log.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WRANGLER = path.join(ROOT, 'test', 'fake-wrangler.mjs');
-const ORB = JSON.parse(fs.readFileSync(path.join(ROOT, 'shops', 'orb.json'), 'utf8'));
+const ORB_FILE = JSON.parse(fs.readFileSync(path.join(ROOT, 'shops', 'orb.json'), 'utf8'));
+// keepExisting on a Supabase shop, as PR #7 built it. The orb itself moved to
+// D1 on 2026-10-24 (test/orb-d1.test.mjs); these tests keep the Supabase path.
+const ORB = { ...ORB_FILE, storage: 'supabase' };
 const MIGRATION = '20261021120000_orders.sql';
 const LEAK_GREP = /whsec_|re_|sb_secret|rk_/; // as test/launch.test.mjs
 
@@ -95,8 +98,8 @@ afterEach(async () => {
 });
 
 test('shops/orb.json turns keepExisting on and guesses no Supabase project name', () => {
-  assert.equal(ORB.keepExisting, true);
-  assert.equal(ORB.supabase?.project, undefined);
+  assert.equal(ORB_FILE.keepExisting, true);
+  assert.equal(ORB_FILE.supabase?.project, undefined);
 });
 
 test('orb plan: no project create, every existing name keep, only the two missing names set, zero writes', async () => {
