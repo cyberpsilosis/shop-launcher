@@ -19,8 +19,11 @@ This repository is public and holds code only. Each shop is one file in
 
 `"storage"` in `shops/<slug>.json` says where the shop keeps its orders, as
 `SHOP.storage` does in the shop's own `config/shop.ts`. Leave it out for
-`"supabase"` (the orb shop). Supabase's free plan allows two projects and
-both are used, so shop three onward is `"d1"`:
+`"supabase"`. Supabase's free plan allows two projects and both are used, so
+shop three onward is `"d1"`, and so is the orb (2026-10-24, with
+keepExisting on). The database is `<slug>-orders` with the slug of
+`shops/<slug>.json` (the orb's is `orb-orders`), so the shop's
+`wrangler.jsonc` must bind `DB` to that name:
 
 | Resource | Found by | Made with |
 |---|---|---|
