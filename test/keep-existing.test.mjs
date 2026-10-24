@@ -115,6 +115,7 @@ test('orb plan: no project create, every existing name keep, only the two missin
     CRON_SECRET: 'set',
   });
   assert.equal(r.summary.keepExisting, true);
+  assert.equal(r.summary.resources[0].name, "the Worker's own", 'no shop-orb name for a project it never looked up');
   assert.match(r.out, /^secret {3}STRIPE_SECRET_KEY +set$/m);
   assert.match(r.out, /^secret {3}STRIPE_WEBHOOK_SECRET +keep$/m);
   assert.doesNotMatch(r.out, /would be set|create /);

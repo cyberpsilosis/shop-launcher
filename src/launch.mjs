@@ -390,7 +390,7 @@ export async function run(opts) {
         count: migrations.length,
       });
     } else {
-      summary.resources.push({ kind: 'supabase_project', name: projectName, action: decide.supabase_project, id: ref ? '***' : null });
+      summary.resources.push({ kind: 'supabase_project', name: keepUnread ? "the Worker's own" : projectName, action: decide.supabase_project, id: ref ? '***' : null });
       for (const m of migrations) {
         summary.resources.push({ kind: 'supabase_migration', name: m.file, action: ['blocked', 'keep'].includes(decide.supabase_project) ? decide.supabase_project : isApplied(m) ? 'skip' : 'create' });
       }
