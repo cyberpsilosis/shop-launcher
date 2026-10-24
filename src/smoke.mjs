@@ -39,12 +39,13 @@ async function until(fn, { tries, sleep }) {
  * deps:
  *   http        the launcher's HTTP client (counts writes)
  *   bases       provider API bases
- *   env         STRIPE_SECRET_KEY, RESEND_ADMIN_KEY, SUPABASE_ACCESS_TOKEN
+ *   env         STRIPE_SECRET_KEY, RESEND_ADMIN_KEY, SUPABASE_ACCESS_TOKEN (Supabase shops)
  *   shopConfig  shops/<slug>.json (siteUrl, smoke.product)
  *   expectCommit  the shop main commit just deployed
  *   browser     { pay({ productUrl, email }) -> { sessionId } }  (Playwright in CI)
  *   sb          supabase provider (serviceKey)
  *   supabaseRef the shop's project ref
+ *   d1          for a D1 shop instead: { query(sql, params, { readOnly }) } on its database
  *   fetchImpl, log, sleep, tries, now, runId
  */
 export async function runSmoke(deps) {
@@ -70,11 +71,26 @@ export async function runSmoke(deps) {
       headers: { apikey: ctx.serviceKey, authorization: `Bearer ${ctx.serviceKey}`, ...(o.headers || {}) },
     });
   };
+  const COLUMNS = 'id,stripe_session_id,stripe_payment_intent,status,alert_email_at,shipped_email_at,tracking_number,supplier_order_ref';
+  // The shop's orders table: through its database API (Supabase) or the D1 query API.
   const readRows = async () => {
-    const { data } = await rest(
-      `/rest/v1/orders?stripe_session_id=eq.${encodeURIComponent(ctx.sessionId)}&select=id,stripe_session_id,stripe_payment_intent,status,alert_email_at,shipped_email_at,tracking_number,supplier_order_ref`,
-    );
+    if (deps.d1) return deps.d1.query(`select ${COLUMNS.replace(/,/g, ', ')} from orders where stripe_session_id = ?1`, [ctx.sessionId], { readOnly: true });
+    const { data } = await rest(`/rest/v1/orders?stripe_session_id=eq.${encodeURIComponent(ctx.sessionId)}&select=${COLUMNS}`);
     return Array.isArray(data) ? data : [];
+  };
+  const markRefunded = async (mark) => {
+    if (deps.d1) {
+      await deps.d1.query(
+        "update orders set status = 'refunded', supplier_order_ref = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') where stripe_session_id = ?2",
+        [mark, ctx.sessionId],
+      );
+      return;
+    }
+    await rest(`/rest/v1/orders?stripe_session_id=eq.${encodeURIComponent(ctx.sessionId)}`, {
+      method: 'PATCH',
+      json: { status: 'refunded', supplier_order_ref: mark },
+      headers: { prefer: 'return=minimal' },
+    });
   };
 
   const steps = {
@@ -169,11 +185,7 @@ export async function runSmoke(deps) {
       const { data } = await stripeReq('/v1/refunds', { method: 'POST', form: [['payment_intent', ctx.paymentIntent], ['metadata[shop_launcher]', 'smoke']] });
       if (!['succeeded', 'pending'].includes(data?.status)) fail(`Stripe refund status ${data?.status}`);
       const mark = `${TEST_MARK} ${deps.runId || ''}`.trim();
-      await rest(`/rest/v1/orders?stripe_session_id=eq.${encodeURIComponent(ctx.sessionId)}`, {
-        method: 'PATCH',
-        json: { status: 'refunded', supplier_order_ref: mark },
-        headers: { prefer: 'return=minimal' },
-      });
+      await markRefunded(mark);
       const rows = await readRows();
       if (!rows.length || rows.some((r) => r.status !== 'refunded' || r.supplier_order_ref !== mark)) fail('the row is not marked refunded and test');
       return `refund ${data.status}; row refunded, marked "${TEST_MARK}"`;

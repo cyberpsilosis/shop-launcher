@@ -16,7 +16,7 @@ export function newState() {
     supabase: { projects: [], migrations: {}, keys: {}, missingPermissions: null },
     resend: { keys: [] },
     stripe: { endpoints: [], sessions: [], events: [], refunds: [] },
-    cloudflare: { secrets: {}, versions: {}, active: {}, tokenExpiresOn: null },
+    cloudflare: { secrets: {}, versions: {}, active: {}, tokenExpiresOn: null, d1: [], d1Forbidden: false },
     resendEmails: [],
     rows: [], // the shop's orders table
     // The fake shop: what its Worker does with a payment. Tests flip these to force a failure.
@@ -236,6 +236,45 @@ export async function startFakes(state = newState()) {
       const c = state.cloudflare;
       const q = p.slice('/cloudflare'.length);
       if (q === '/user/tokens/verify') return send(200, { success: true, result: { id: 'tok', status: 'active', expires_on: c.tokenExpiresOn } });
+      // D1: databases by name or id; a query runs the two statements the smoke
+      // sends against the shop's rows, once the orders migration is applied.
+      if (/^\/accounts\/[^/]+\/d1\//.test(q) && c.d1Forbidden) return send(403, { success: false, errors: [{ code: 10000, message: 'Authentication error' }] });
+      if ((m = q.match(/^\/accounts\/([^/]+)\/d1\/database$/)) && req.method === 'POST') {
+        const j = JSON.parse(body);
+        if (c.d1.some((d) => d.name === j.name)) return send(400, { success: false, errors: [{ code: 7502, message: 'database already exists' }] });
+        const d = { uuid: 'd1-' + rnd(8), name: j.name, migrations: [] };
+        c.d1.push(d);
+        return send(200, { success: true, result: { uuid: d.uuid, name: d.name } });
+      }
+      if ((m = q.match(/^\/accounts\/([^/]+)\/d1\/database\/([^/]+)$/)) && req.method === 'GET') {
+        const key = decodeURIComponent(m[2]);
+        const d = c.d1.find((x) => x.uuid === key || x.name === key);
+        if (!d) return send(404, { success: false, errors: [{ code: 7404, message: 'database not found' }] });
+        return send(200, { success: true, result: { uuid: d.uuid, name: d.name } });
+      }
+      if ((m = q.match(/^\/accounts\/([^/]+)\/d1\/database\/([^/]+)\/query$/)) && req.method === 'POST') {
+        const d = c.d1.find((x) => x.uuid === m[2]);
+        if (!d) return send(404, { success: false, errors: [{ code: 7404, message: 'database not found' }] });
+        if (!d.migrations.length) return send(400, { success: false, errors: [{ code: 7500, message: 'no such table: orders' }] });
+        const j = JSON.parse(body);
+        const ok = (results) => send(200, { success: true, result: [{ success: true, results }] });
+        if (/^select [a-z_, ]+ from orders where stripe_session_id = \?1$/.test(j.sql)) return ok(state.rows.filter((r) => r.stripe_session_id === j.params[0]));
+        if (/^update orders set status = 'refunded', supplier_order_ref = \?1, updated_at = .* where stripe_session_id = \?2$/.test(j.sql)) {
+          for (const r of state.rows.filter((x) => x.stripe_session_id === j.params[1])) Object.assign(r, { status: 'refunded', supplier_order_ref: j.params[0] });
+          return ok([]);
+        }
+        return send(400, { success: false, errors: [{ code: 7500, message: 'the fake does not know this statement' }] });
+      }
+      // Fake wrangler only: `wrangler d1 migrations apply DB --remote` sends the
+      // database name and the files it found; the ones not yet applied are applied.
+      if (q === '/fake/d1-migrate' && req.method === 'POST') {
+        const j = JSON.parse(body);
+        const d = c.d1.find((x) => x.name === j.name);
+        if (!d) return send(404, { success: false });
+        const todo = j.files.filter((f) => !d.migrations.includes(f));
+        d.migrations.push(...todo);
+        return send(200, { success: true, result: { applied: todo } });
+      }
       if ((m = q.match(/^\/accounts\/([^/]+)\/workers\/scripts\/([^/]+)\/secrets$/))) {
         const w = c.secrets[m[2]];
         if (req.method === 'GET') {

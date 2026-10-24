@@ -15,6 +15,34 @@ straight from one API to the next, inside the job:
 This repository is public and holds code only. Each shop is one file in
 `shops/` (`shops/orb.json`): its slug, repo, Worker name and public URL.
 
+## Storage: Supabase or D1
+
+`"storage"` in `shops/<slug>.json` says where the shop keeps its orders, as
+`SHOP.storage` does in the shop's own `config/shop.ts`. Leave it out for
+`"supabase"` (the orb shop). Supabase's free plan allows two projects and
+both are used, so shop three onward is `"d1"`:
+
+| Resource | Found by | Made with |
+|---|---|---|
+| D1 database `<slug>-orders` | name, in `CLOUDFLARE_ACCOUNT_ID` | `POST /accounts/{id}/d1/database` |
+| Its tables | wrangler's own migration table | `wrangler d1 migrations apply DB --remote`, from the shop's `d1/migrations/`, before the first deploy |
+
+A D1 shop has no database key: only its Worker reaches the database, through
+the `DB` binding `npm run shop:sync` writes into the shop's `wrangler.jsonc`.
+So it needs no `SUPABASE_ACCESS_TOKEN` or `SUPABASE_ORG_ID`, and its Worker
+gets no `NEXT_PUBLIC_SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY`. Before
+anything else the launcher checks that `wrangler.jsonc` binds `DB` to
+`<slug>-orders` (and to that database's id, if it names one); otherwise
+wrangler would migrate and bind another database, so plan and apply stop
+there. `CLOUDFLARE_API_TOKEN` needs **Account > D1 > Edit** as well as its
+Workers permissions; without it plan names that permission.
+
+Plan sends GET calls only, and which migrations a database already has is a
+read Cloudflare takes only as a POST. So for an existing database plan says
+`update` ("wrangler applies whatever is missing"), and apply says `skip` when
+wrangler had nothing to apply. The smoke reads and marks the order row
+through D1's query API with the same token.
+
 ## Running it
 
 Actions > launch > Run workflow, with a shop slug and a mode. The store's
@@ -45,7 +73,8 @@ dispatch op (piece 5) will do the same thing.
 The smoke needs the shop's Stripe test key to allow, beyond piece 1's list:
 Checkout Sessions read, Events read, Refunds write. It reads the orders table
 through the shop's own database API with the service key (revealed as in
-apply), and Resend's sent emails with `RESEND_ADMIN_KEY`.
+apply), or for a D1 shop through D1's query API, and Resend's sent emails
+with `RESEND_ADMIN_KEY`.
 
 `rotate` means a secret that cannot be read back (a Stripe webhook secret,
 a Resend key) is missing from the Worker. apply makes a new one and puts it

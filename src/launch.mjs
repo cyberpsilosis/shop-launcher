@@ -33,6 +33,13 @@ const NEEDS = {
 export const SLUG = /^[a-z][a-z0-9]{1,30}$/;
 export const TOKENS = ['SUPABASE_ACCESS_TOKEN', 'RESEND_ADMIN_KEY', 'STRIPE_SECRET_KEY', 'CLOUDFLARE_API_TOKEN'];
 export const VARIABLES = ['SUPABASE_ORG_ID', 'CLOUDFLARE_ACCOUNT_ID'];
+// Where a shop keeps its orders: "supabase" (the default, the orb shop) or
+// "d1", a Cloudflare D1 database bound to the Worker as DB (shop three onward:
+// Supabase's free plan allows two projects, and both are used). A D1 shop has
+// no database key, so it needs no Supabase token, org or secrets.
+export const STORAGES = ['supabase', 'd1'];
+export const D1_BINDING = 'DB';
+const SUPABASE_ONLY = ['SUPABASE_ACCESS_TOKEN', 'SUPABASE_ORG_ID'];
 // The Worker secrets a shop needs, and which resource each one comes from.
 export const SECRETS = [
   { name: 'NEXT_PUBLIC_SUPABASE_URL', from: 'supabase_project' },
@@ -73,24 +80,91 @@ export function writeSecretsFile(file, values) {
   check();
 }
 
+// Resolves with the command's output lines (as logged), for a caller that reads them.
 function runCommand(cmd, { cwd, env, log }) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd[0], cmd.slice(1), { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = [];
     const pipe = (stream) => {
       let buf = '';
       stream.on('data', (d) => {
         buf += d;
         const lines = buf.split('\n');
         buf = lines.pop();
-        for (const l of lines) log.info(`  | ${l}`);
+        for (const l of lines) {
+          out.push(l);
+          log.info(`  | ${l}`);
+        }
       });
-      stream.on('end', () => buf && log.info(`  | ${buf}`));
+      stream.on('end', () => {
+        if (!buf) return;
+        out.push(buf);
+        log.info(`  | ${buf}`);
+      });
     };
     pipe(child.stdout);
     pipe(child.stderr);
     child.on('error', reject);
-    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`${cmd.slice(0, 3).join(' ')} exited ${code}`))));
+    child.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`${cmd.slice(0, 3).join(' ')} exited ${code}`))));
   });
+}
+
+// wrangler.jsonc is JSON with comments and trailing commas. Strip both,
+// outside strings only: a URL's "//" is not a comment.
+function scanJson(text, onCode) {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '"') {
+      const start = i;
+      for (i++; i < text.length && text[i] !== '"'; i++) if (text[i] === '\\') i++;
+      out += text.slice(start, i + 1);
+    } else {
+      const r = onCode(text, i);
+      out += r.text;
+      i = r.next;
+    }
+  }
+  return out;
+}
+export function parseJsonc(text) {
+  const noComments = scanJson(text, (t, i) => {
+    if (t[i] === '/' && t[i + 1] === '/') {
+      const end = t.indexOf('\n', i);
+      return { text: '\n', next: end === -1 ? t.length : end };
+    }
+    if (t[i] === '/' && t[i + 1] === '*') {
+      const end = t.indexOf('*/', i + 2);
+      if (end === -1) throw new Error('unclosed /* comment');
+      return { text: ' ', next: end + 1 };
+    }
+    return { text: t[i], next: i };
+  });
+  const noTrailing = scanJson(noComments, (t, i) => {
+    if (t[i] !== ',') return { text: t[i], next: i };
+    let j = i + 1;
+    while (/\s/.test(t[j] ?? '')) j++;
+    return { text: t[j] === '}' || t[j] === ']' ? '' : ',', next: i };
+  });
+  return JSON.parse(noTrailing);
+}
+
+// The shop's own wrangler config must bind DB to <slug>-orders (written by
+// `npm run shop:sync`), or wrangler would provision, migrate and bind another
+// database than the one the launcher made. Returns null when it does.
+export function d1BindingProblem(shopDir, dbName, uuid) {
+  const file = ['wrangler.jsonc', 'wrangler.json'].map((f) => shopDir && path.join(shopDir, f)).find((f) => f && fs.existsSync(f));
+  if (!file) return `the shop has no wrangler.jsonc or wrangler.json (wrangler.toml is not read)`;
+  let cfg;
+  try {
+    cfg = parseJsonc(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    return `${path.basename(file)} does not parse: ${e.message}`;
+  }
+  const b = (cfg.d1_databases || []).find((x) => x?.binding === D1_BINDING);
+  if (!b) return `${path.basename(file)} has no d1_databases binding ${D1_BINDING}: run \`npm run shop:sync\` with storage "d1" in the shop`;
+  if (b.database_name !== dbName) return `${path.basename(file)} binds ${D1_BINDING} to "${b.database_name}", not "${dbName}"`;
+  if (b.database_id && uuid && b.database_id !== uuid) return `${path.basename(file)} binds ${D1_BINDING} to another database id than "${dbName}" has`;
+  return null;
 }
 
 // Children get a clean environment: no provider token reaches the shop's
@@ -158,9 +232,13 @@ export async function run(opts) {
     if (mode === 'rollback' && !ROLLBACK_STEPS.includes(step)) throw new UsageError(`rollback --step must be ${ROLLBACK_STEPS.join(' or ')}`);
     if (!SLUG.test(shop || '')) throw new UsageError('shop must be 2 to 31 lowercase letters or digits, starting with a letter');
     if (!shopConfig || shopConfig.slug !== shop) throw new UsageError(`shops/${shop}.json is missing or names another slug`);
+    const storage = shopConfig.storage ?? 'supabase';
+    if (!STORAGES.includes(storage)) throw new UsageError(`shops/${shop}.json storage must be ${STORAGES.join(' or ')}`);
+    const onD1 = storage === 'd1';
 
     for (const k of [...TOKENS, ...VARIABLES, 'STRIPE_LIVE_KEY']) log.mask(env[k]);
-    const needed = NEEDS[mode === 'rollback' ? `rollback/${step}` : mode] || [...TOKENS, ...VARIABLES];
+    const needed =
+      NEEDS[mode === 'rollback' ? `rollback/${step}` : mode] || [...TOKENS, ...VARIABLES].filter((k) => !onD1 || !SUPABASE_ONLY.includes(k));
     const missing = needed.filter((k) => !env[k]);
     if (missing.length) throw new UsageError(`missing environment values: ${missing.join(', ')}`);
     if (/^[rs]k_live_/.test(env.STRIPE_SECRET_KEY || '')) {
@@ -178,6 +256,7 @@ export async function run(opts) {
     const cf = cloudflare(http, bases.cloudflare, env);
     const n = now();
     let ref = null;
+    let installed = false;
     const siteUrl = () => {
       const o = env.LAUNCHER_FAKE_APIS === '1' && env.SHOP_SITE_URL;
       if (o && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(o)) throw new UsageError('SHOP_SITE_URL may only point at localhost');
@@ -201,7 +280,7 @@ export async function run(opts) {
     } catch (e) {
       summary.warnings.push({ token: 'CLOUDFLARE_API_TOKEN', status: `verify failed: ${e.message}` });
     }
-    for (const k of TOKENS) {
+    for (const k of TOKENS.filter((t) => !onD1 || !SUPABASE_ONLY.includes(t))) {
       const iso = env[`${k}_EXPIRES_ON`];
       if (!iso) continue;
       const d = daysLeft(iso, n);
@@ -228,11 +307,22 @@ export async function run(opts) {
 
     const projectName = `shop-${shop}`;
     const keyName = `shop-${shop}`;
+    const dbName = `${shop}-orders`;
 
-    const project = await read('supabase_project', () => sb.findProject(projectName, env.SUPABASE_ORG_ID));
+    // Supabase shops: the project and its migration history. D1 shops: the
+    // database by name; which migrations it has, wrangler reads in apply
+    // (that read is a POST, which plan never sends).
+    const project = onD1 ? null : await read('supabase_project', () => sb.findProject(projectName, env.SUPABASE_ORG_ID));
     ref = project ? project.ref || project.id : null;
     log.mask(ref);
-    const migrations = readMigrations(shopDir ? path.join(shopDir, 'supabase', 'migrations') : null);
+    let db = onD1 ? await read('d1_database', () => cf.findD1(dbName)) : null;
+    log.mask(db?.uuid);
+    const migrations = readMigrations(shopDir ? path.join(shopDir, onD1 ? 'd1' : 'supabase', 'migrations') : null);
+    if (onD1 && !migrations.length) blocked.push({ kind: 'd1_migrations', message: 'the shop has no d1/migrations/*.sql: its orders table would never be made' });
+    if (onD1 && db !== undefined) {
+      const problem = d1BindingProblem(shopDir, dbName, db?.uuid);
+      if (problem) blocked.push({ kind: 'd1_binding', message: problem });
+    }
     const applied = ref ? (await read('supabase_migration', () => sb.listMigrations(ref))) || [] : [];
     const isApplied = (m) => applied.some((a) => a.version === m.version || a.name === m.name || a.name === m.base);
     const cfState = (await read('worker_secrets', () => cf.secretNames(shopConfig.worker))) || { exists: false, names: new Set() };
@@ -243,7 +333,8 @@ export async function run(opts) {
 
     const has = (name) => cfState.names.has(name);
     const decide = {
-      supabase_project: project === undefined ? 'blocked' : project ? 'skip' : 'create',
+      supabase_project: onD1 ? null : project === undefined ? 'blocked' : project ? 'skip' : 'create',
+      d1_database: !onD1 ? null : db === undefined ? 'blocked' : db ? 'skip' : 'create',
       resend_key: keys.length === 0 ? 'create' : has('RESEND_API_KEY') ? 'skip' : 'rotate',
       stripe_webhook:
         endpoints.length === 0
@@ -256,15 +347,28 @@ export async function run(opts) {
     };
     for (const b of blocked) decide[b.kind] = 'blocked';
 
-    summary.resources.push({ kind: 'supabase_project', name: projectName, action: decide.supabase_project, id: ref ? '***' : null });
-    for (const m of migrations) {
-      summary.resources.push({ kind: 'supabase_migration', name: m.file, action: decide.supabase_project === 'blocked' ? 'blocked' : isApplied(m) ? 'skip' : 'create' });
+    if (onD1) {
+      summary.resources.push({ kind: 'd1_database', name: dbName, action: decide.d1_database, id: db ? '***' : null });
+      // A new database gets every file; an existing one whatever wrangler finds
+      // missing ("update"; apply reports "skip" when wrangler had none to apply).
+      summary.resources.push({
+        kind: 'd1_migrations',
+        name: 'd1/migrations',
+        action: blocked.some((b) => b.kind.startsWith('d1_')) ? 'blocked' : db ? 'update' : 'create',
+        count: migrations.length,
+      });
+    } else {
+      summary.resources.push({ kind: 'supabase_project', name: projectName, action: decide.supabase_project, id: ref ? '***' : null });
+      for (const m of migrations) {
+        summary.resources.push({ kind: 'supabase_migration', name: m.file, action: decide.supabase_project === 'blocked' ? 'blocked' : isApplied(m) ? 'skip' : 'create' });
+      }
     }
     summary.resources.push({ kind: 'resend_key', name: keyName, action: decide.resend_key, permission: 'sending_access' });
     summary.resources.push({ kind: 'stripe_webhook', name: webhookUrl, action: decide.stripe_webhook, events: WEBHOOK_EVENTS, id: endpoints.length ? '***' : null });
 
-    const toSet = SECRETS.filter((s) => !has(s.name) || ['create', 'rotate'].includes(decide[s.from]));
-    for (const s of SECRETS) summary.secrets.push({ name: s.name, state: toSet.includes(s) ? 'set' : 'unchanged' });
+    const secretsFor = SECRETS.filter((s) => !onD1 || s.from !== 'supabase_project');
+    const toSet = secretsFor.filter((s) => !has(s.name) || ['create', 'rotate'].includes(decide[s.from]));
+    for (const s of secretsFor) summary.secrets.push({ name: s.name, state: toSet.includes(s) ? 'set' : 'unchanged' });
     summary.resources.push({
       kind: 'worker_secrets',
       name: shopConfig.worker,
@@ -284,6 +388,7 @@ export async function run(opts) {
 
     if (mode === 'smoke') {
       // Smoke: deploy the shop's main as it is (no secret changes), then the seven checks.
+      if (onD1 && !db) throw new Error(`there is no D1 database ${dbName} yet: run apply first`);
       const prev = await recordActive();
       await deploy(null);
       const green = await smokeOrRollback(prev);
@@ -318,10 +423,25 @@ export async function run(opts) {
         status = (await sb.getProject(ref))?.status;
       }
     }
-    for (const m of migrations) {
+    for (const m of onD1 ? [] : migrations) {
       if (decide.supabase_project === 'skip' && isApplied(m)) continue;
       await sb.applyMigration(ref, { name: m.base, query: fs.readFileSync(m.path, 'utf8') });
       log.info(`applied  supabase_migration   ${m.file}`);
+    }
+    if (onD1) {
+      if (decide.d1_database === 'create') {
+        db = await cf.createD1(dbName);
+        log.mask(db.uuid);
+        summary.resources.find((r) => r.kind === 'd1_database').id = '***';
+        log.info(`created  d1_database          ${dbName}`);
+      }
+      // Before any deploy, so no version of the Worker runs without its tables.
+      // wrangler applies only what the database has not had yet.
+      const out = await wrangler(['d1', 'migrations', 'apply', D1_BINDING, '--remote']);
+      const none = out.some((l) => /No migrations to apply/.test(l));
+      const mig = summary.resources.find((r) => r.kind === 'd1_migrations');
+      if (none && mig.action === 'update') mig.action = 'skip';
+      log.info(`${none ? 'skip    ' : 'applied '} d1_migrations        ${none ? 'none missing' : 'd1/migrations'}`);
     }
     if (need('NEXT_PUBLIC_SUPABASE_URL')) values.NEXT_PUBLIC_SUPABASE_URL = `https://${ref}.supabase.co`;
     if (need('SUPABASE_SERVICE_ROLE_KEY')) {
@@ -393,12 +513,29 @@ export async function run(opts) {
     return summary;
 
     // ---- helpers for deploy, smoke and rollback ------------------------------
+    // The shop's install runs once a launch, before its first wrangler command.
+    async function installOnce() {
+      if (installed || (env.LAUNCHER_FAKE_APIS === '1' && deployCmd) || !shopConfig.install) return;
+      log.info(`running  ${shopConfig.install.slice(0, 3).join(' ')}`);
+      await runCommand(shopConfig.install, { cwd: shopDir, env: childEnv(env), log });
+      installed = true;
+    }
+
+    // A wrangler command in the shop's checkout, with only the two Cloudflare values.
+    async function wrangler(args) {
+      await installOnce();
+      const fake = env.LAUNCHER_FAKE_APIS === '1' && deployCmd;
+      const cmd = fake ? [...deployCmd, ...args] : ['npx', '--no-install', 'wrangler', ...args];
+      log.info(`running  wrangler ${args.slice(0, 3).join(' ')}`);
+      return runCommand(cmd, { cwd: shopDir, env: childEnv(env, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID }), log });
+    }
+
     async function deploy(values) {
       if (values) writeSecretsFile(secretsFile, values);
       const fake = env.LAUNCHER_FAKE_APIS === '1' && deployCmd;
       const cmds = fake
         ? [deployCmd]
-        : [...(shopConfig.install ? [shopConfig.install] : []), ...(shopConfig.build ? [shopConfig.build] : []), shopConfig.deploy];
+        : [...(shopConfig.install && !installed ? [shopConfig.install] : []), ...(shopConfig.build ? [shopConfig.build] : []), shopConfig.deploy];
       // The shop's /api/version reports the commit Workers Builds would set.
       const build = expectCommit ? { WORKERS_CI_COMMIT_SHA: expectCommit, WORKERS_CI_BRANCH: 'main' } : {};
       for (let i = 0; i < cmds.length; i++) {
@@ -531,8 +668,9 @@ export async function run(opts) {
 
     async function smokeOrRollback(prev, only) {
       if (!browser && !only) throw new Error('smoke needs a browser (Playwright)');
+      const d1 = onD1 ? { query: (sql, params, o) => cf.queryD1(db.uuid, sql, params, o) } : undefined;
       summary.checks = await runSmoke({
-        http, bases, env, shopConfig: { ...shopConfig, siteUrl: siteUrl() }, expectCommit, browser, sb, supabaseRef: ref, log, runId,
+        http, bases, env, shopConfig: { ...shopConfig, siteUrl: siteUrl() }, expectCommit, browser, sb, supabaseRef: ref, d1, log, runId,
         sleep: smokeSleep, tries: smokeTries, only,
       });
       for (const c of summary.checks) log.info(`${c.ok ? 'pass' : c.skipped ? 'skip' : 'FAIL'}     ${c.title}: ${c.detail}`);
