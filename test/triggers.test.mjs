@@ -61,9 +61,19 @@ test('cancel-in-progress true fails', () => {
   assert.ok(checkWorkflows(dir).some((p) => p.includes('concurrency')));
 });
 
-test('reading secrets outside the provision environment fails', () => {
+test('reading secrets outside the provision and live environments fails', () => {
   const dir = copyWith('launch.yml', (t) => t.replace('    environment: provision\n', ''));
-  assert.ok(checkWorkflows(dir).some((p) => p.includes('outside the provision environment')));
+  assert.ok(checkWorkflows(dir).some((p) => p.includes('outside the provision and live environments')));
+});
+
+test('naming the live key outside the live environment fails', () => {
+  const dir = copyWith('launch.yml', (t) => t.replace("STRIPE_SECRET_KEY: ${{ secrets[format('STRIPE_RK_TEST__{0}'", "STRIPE_SECRET_KEY: ${{ secrets[format('STRIPE_RK_LIVE__{0}'"));
+  assert.ok(checkWorkflows(dir).some((p) => p.includes('names the live Stripe key outside the live environment')));
+});
+
+test('a live-environment job without its mode condition fails', () => {
+  const dir = copyWith('launch.yml', (t) => t.replace("(inputs.mode == 'live' && needs.launch.result == 'skipped') ||", "(needs.launch.result == 'skipped') ||"));
+  assert.ok(checkWorkflows(dir).some((p) => p.includes('needs an if on inputs.mode')));
 });
 
 test('launch.yml never switches on the fake APIs', () => {
@@ -96,12 +106,22 @@ test('launch.yml: inputs, environment, cleanup order', () => {
   }
   // Every checkout drops its credentials.
   for (const s of steps.filter((x) => /actions\/checkout/.test(x.uses || ''))) assert.equal(s.with['persist-credentials'], false);
-  // The modes not built yet are refused in the first job, with their piece.
-  assert.match(doc.jobs.check.steps[0].run, /plan\|apply\|smoke\) ;;/);
+  // All five modes pass the first job; anything else is refused there.
+  assert.match(doc.jobs.check.steps[0].run, /plan\|apply\|smoke\|live\|rollback\) ;;/);
   // The smoke installs its browser only in smoke mode, before the launcher runs.
   const pw = idx(/^Install the launcher and its browser/);
   assert.ok(pw >= 0 && pw < runIdx);
   assert.equal(steps[pw].if, "inputs.mode == 'smoke'");
   assert.match(steps[runIdx].run, /--expect-commit "\$\(git -C shop rev-parse HEAD\)"/);
-  assert.match(doc.jobs.check.steps[0].run, /live\|rollback\) echo "::error::mode \$MODE is not built yet: it arrives with piece 3/);
+  // The live job: environment live, the same cleanup order, tracing off, no credentials kept.
+  const live = doc.jobs.live;
+  assert.equal(live.environment, 'live');
+  assert.deepEqual(live['runs-on'], ['self-hosted', 'shop-launcher']);
+  const ls = live.steps;
+  const li = (re) => ls.findIndex((x) => re.test(x.name || ''));
+  assert.ok(li(/^Run the launcher/) >= 0 && li(/^Delete the secrets file/) > li(/^Run the launcher/));
+  assert.match(ls[ls.length - 1].name, /Clear RUNNER_TEMP/);
+  for (const x of ls) if (x.run && /\$\{\{\s*secrets[.[]/.test(JSON.stringify(x.env || {}))) assert.match(x.run, /^set \+x/, x.name);
+  for (const x of ls.filter((y) => /actions\/checkout/.test(y.uses || ''))) assert.equal(x.with['persist-credentials'], false);
+  assert.equal(job.if, "inputs.mode != 'live'");
 });

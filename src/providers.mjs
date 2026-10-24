@@ -87,6 +87,10 @@ export function stripe(http, base, env) {
     async deleteEndpoint(id) {
       await req(`/v1/webhook_endpoints/${id}`, { method: 'DELETE' });
     },
+    // Live rollback: the endpoint stays (its history with it) but Stripe stops sending.
+    async disableEndpoint(id) {
+      await req(`/v1/webhook_endpoints/${id}`, { method: 'POST', form: [['disabled', 'true']] });
+    },
   };
 }
 
@@ -107,6 +111,19 @@ export function cloudflare(http, base, env) {
       const d = (data?.result?.deployments || [])[0];
       const v = [...(d?.versions || [])].sort((a, b) => (b.percentage || 0) - (a.percentage || 0))[0];
       return v?.version_id || null;
+    },
+    // Every version id in the deployment history, newest deployment first.
+    async deployedVersions(worker) {
+      const { status, data } = await req(`/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${worker}/deployments`, { allow: [404] });
+      if (status === 404) return [];
+      const ids = [];
+      for (const d of data?.result?.deployments || []) for (const v of d.versions || []) if (!ids.includes(v.version_id)) ids.push(v.version_id);
+      return ids;
+    },
+    // Binding names of one version (Cloudflare never returns a secret's value).
+    async bindingNames(worker, versionId) {
+      const { data } = await req(`/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${worker}/versions/${versionId}`);
+      return new Set((data?.result?.resources?.bindings || []).map((b) => b.name));
     },
     async tokenExpiry() {
       const { data } = await req('/user/tokens/verify');

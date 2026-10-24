@@ -181,7 +181,8 @@ export async function runSmoke(deps) {
   };
 
   let stopped = null;
-  for (const c of CHECKS) {
+  // deps.only: run a subset (live mode runs only 'pages': no test card on a live key).
+  for (const c of deps.only ? CHECKS.filter((x) => deps.only.includes(x.id)) : CHECKS) {
     if (stopped) {
       results.push({ id: c.id, title: c.title, ok: false, skipped: true, detail: `not run: ${stopped} failed first` });
       continue;

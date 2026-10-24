@@ -260,3 +260,11 @@ Names only: no secret value, project ref or webhook id appears in it.
 `test/fake-wrangler.mjs`); no real account is touched. CI (`test.yml`) runs
 the trigger check and the tests on every push, on the laptop runner, since
 GitHub's hosted runners do not start on this account.
+
+## Live and rollback (piece 3)
+
+- `mode=live` runs only in the `live` job, environment `live` (main only, required reviewer Elijah). GitHub holds that job in "Waiting" until he taps Approve; no runner takes it and no secret is read before then. The `live` environment holds `STRIPE_RK_LIVE__<SHOP>` plus its own copies of `CLOUDFLARE_API_TOKEN` and `GH_PROVISION_TOKEN` (a job sees one environment's secrets).
+- Live goes up only on top of a test-key version running the commit the last green smoke proved. It makes a new live webhook endpoint and one new Worker version with the live key, that endpoint's secret and the marker `SHOP_LAUNCHER_LIVE`, then runs smoke check 1. If check 1 fails it rolls back by itself and deletes the new endpoint.
+- `mode=rollback`: the `launch` job (provision, no approval) rolls the Worker back to the newest version without the marker, which holds the test key and test webhook secret. Then the `live` job, after Elijah's approval, disables the live endpoint. apply and smoke refuse while the shop is live.
+- Night: an approval tapped while the laptop is off queues for the runner and starts when Elijah logs in next morning. GitHub fails a job still queued 24 hours after approval; dispatch again.
+- `node scripts/dispatch-dry-run.mjs live orb` prints, from the real launch.yml, which jobs run, wait or skip and which secrets each names.
