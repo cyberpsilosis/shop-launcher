@@ -5,8 +5,12 @@
 //     in FAKE_COMMIT. Writes a report of what it saw (file mode, secret names,
 //     which environment names reached it). Values are never written to it.
 //   rollback <version id>: makes that version active again.
+//   d1 migrations apply DB --remote: reads the DB binding from wrangler.jsonc
+//     in its directory, as wrangler does, and applies d1/migrations to it.
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { parseJsonc } from '../src/launch.mjs';
 
 const base = process.env.FAKE_CF_URL;
 const worker = process.env.FAKE_WORKER;
@@ -22,6 +26,20 @@ if (r !== -1) {
   const res = await post('/fake/rollback', { worker, version: process.argv[r + 1] });
   if (!res.ok) process.exit(1);
   console.log(`Rolled back ${worker}`);
+  process.exit(0);
+}
+
+if (process.argv.includes('d1')) {
+  const cfg = parseJsonc(fs.readFileSync('wrangler.jsonc', 'utf8'));
+  const b = (cfg.d1_databases || []).find((x) => x.binding === process.argv[process.argv.indexOf('apply') + 1]);
+  const files = fs.readdirSync(path.join('.', b.migrations_dir || 'migrations')).filter((f) => f.endsWith('.sql')).sort();
+  const res = await post('/fake/d1-migrate', { name: b.database_name, files });
+  if (!res.ok) {
+    console.error(`✘ [ERROR] Couldn't find a D1 DB named '${b.database_name}'`);
+    process.exit(1);
+  }
+  const { result } = await res.json();
+  console.log(result.applied.length ? `Migrations to be applied:\n${result.applied.join('\n')}` : '✅ No migrations to apply!');
   process.exit(0);
 }
 

@@ -3,6 +3,8 @@
 // Every resource is found by a name or tag that comes from the shop slug, so a
 // second run finds what the first one made.
 
+import { HttpError } from './http.mjs';
+
 export const WEBHOOK_EVENTS = ['checkout.session.completed', 'checkout.session.async_payment_succeeded'];
 
 export function supabase(http, base, env) {
@@ -129,5 +131,36 @@ export function cloudflare(http, base, env) {
       const { data } = await req('/user/tokens/verify');
       return { status: data?.result?.status, expiresOn: data?.result?.expires_on || null };
     },
+    // D1, for a shop whose storage is "d1". Found by name (the path takes a
+    // name as well as an id, as wrangler uses it); null when there is none.
+    async findD1(name) {
+      const { status, data } = await d1(() => req(`/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/d1/database/${encodeURIComponent(name)}?fields=uuid,name`, { allow: [404] }));
+      if (status === 404) return null;
+      const r = data?.result;
+      return r?.uuid && r.name === name ? { uuid: r.uuid, name: r.name } : null;
+    },
+    async createD1(name) {
+      const { data } = await d1(() => req(`/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/d1/database`, { method: 'POST', json: { name } }));
+      if (!data?.result?.uuid) throw new Error('cloudflare: creating the D1 database returned no id');
+      return { uuid: data.result.uuid, name: data.result.name };
+    },
+    // One SQL statement with ?1, ?2... params; its rows. readOnly for a SELECT.
+    async queryD1(uuid, sql, params = [], { readOnly = false } = {}) {
+      const { data } = await d1(() => req(`/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/d1/database/${uuid}/query`, { method: 'POST', json: { sql, params }, readOnly }));
+      const r = (data?.result || [])[0];
+      if (!r?.success) throw new Error('cloudflare: the D1 query did not succeed');
+      return r.results || [];
+    },
   };
+}
+
+// Cloudflare answers a token without the D1 permission with 403; name it, as
+// Supabase's missing_permissions is named.
+async function d1(call) {
+  try {
+    return await call();
+  } catch (e) {
+    if (e instanceof HttpError && e.status === 403 && !e.missingPermissions.length) e.missingPermissions = ['Account > D1 > Edit'];
+    throw e;
+  }
 }

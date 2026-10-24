@@ -3,6 +3,8 @@
 // In plan mode it refuses anything but GET before a byte leaves the machine,
 // so a bug in the plan path cannot write. It records every call (method, host,
 // path; never headers or bodies) so the summary can state how many writes ran.
+// A read the API only takes as a POST (a D1 SELECT) is marked `readOnly`: it
+// does not count as a write, and plan still refuses it, being a POST.
 // Errors carry the provider, method, path and status, plus only the fields we
 // know are safe (Supabase's missing_permissions, an error code). Response
 // bodies are never printed.
@@ -52,7 +54,7 @@ export function apiBases(env) {
 export function createHttp({ mode, fetchImpl = globalThis.fetch }) {
   const calls = [];
 
-  async function request(provider, base, path, { method = 'GET', headers = {}, json, form, allow = [] } = {}) {
+  async function request(provider, base, path, { method = 'GET', headers = {}, json, form, allow = [], readOnly = false } = {}) {
     const pathOnly = path.split('?')[0];
     if (mode === 'plan' && method !== 'GET') {
       throw new PlanWriteRefused(`plan mode refused ${method} ${provider} ${pathOnly}`);
@@ -67,7 +69,7 @@ export function createHttp({ mode, fetchImpl = globalThis.fetch }) {
       h['content-type'] = 'application/x-www-form-urlencoded';
     }
     const url = base + path;
-    calls.push({ provider, method, host: new URL(url).host, path: pathOnly });
+    calls.push({ provider, method, host: new URL(url).host, path: pathOnly, ...(readOnly ? { readOnly: true } : {}) });
     const res = await fetchImpl(url, { method, headers: h, body });
     const text = await res.text();
     let data = null;
@@ -87,6 +89,6 @@ export function createHttp({ mode, fetchImpl = globalThis.fetch }) {
   return {
     request,
     calls,
-    writes: () => calls.filter((c) => c.method !== 'GET').length,
+    writes: () => calls.filter((c) => c.method !== 'GET' && !c.readOnly).length,
   };
 }
