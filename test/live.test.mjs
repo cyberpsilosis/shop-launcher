@@ -18,6 +18,8 @@ import { dryRun, readLaunch } from '../scripts/dispatch-dry-run.mjs';
 import { LIVE_MARK } from '../src/launch.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// shops/orb.json as it was before keepExisting: a shop the launcher sets up from nothing.
+const NEW_SHOP = path.join(ROOT, 'test', 'fixtures', 'orb-new-shop.json');
 const LAUNCH = path.join(ROOT, 'src', 'launch.mjs');
 const SECRETS_SH = path.join(ROOT, 'scripts', 'secrets-file.sh');
 const WRANGLER = path.join(ROOT, 'test', 'fake-wrangler.mjs');
@@ -56,7 +58,7 @@ function jobEnv(job) {
 
 async function launch(mode, { commit = C1, step, job = mode === 'live' || step === 'endpoint' ? 'live' : 'provision', env = {} } = {}) {
   const summaryJson = path.join(runnerTemp, `summary-${mode}-${Date.now()}.json`);
-  const args = [LAUNCH, '--shop', 'orb', '--mode', mode, '--shop-dir', shopDir, '--summary-json', summaryJson, '--deploy-cmd', `node ${WRANGLER}`, '--expect-commit', commit];
+  const args = [LAUNCH, '--shop', 'orb', '--shop-config', NEW_SHOP, '--mode', mode, '--shop-dir', shopDir, '--summary-json', summaryJson, '--deploy-cmd', `node ${WRANGLER}`, '--expect-commit', commit];
   if (step) args.push('--step', step);
   if (mode === 'smoke') args.push('--browser', 'fake');
   let file;

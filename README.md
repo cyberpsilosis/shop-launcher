@@ -43,6 +43,29 @@ read Cloudflare takes only as a POST. So for an existing database plan says
 wrangler had nothing to apply. The smoke reads and marks the order row
 through D1's query API with the same token.
 
+## A shop that already runs: keepExisting
+
+`"keepExisting": true` in `shops/<slug>.json` is for a shop that was set up
+by hand before the launcher (the orb). Off by default; every other shop
+behaves as before.
+
+- Worker names: the secrets Cloudflare lists plus the bindings of the active
+  version, so a plain variable set in the dashboard counts too. Each of the
+  six names is `keep` (the Worker has it; apply never sends it) or `set` (it
+  is missing; apply adds it). Nothing the Worker has is overwritten, and
+  `wrangler deploy --secrets-file` keeps every secret not in the file.
+- Supabase: never `create`. With `"supabase": {"project": "<name>"}` the
+  launcher looks that project up by name: found is `skip`, and only
+  migrations missing from its history are applied. Not found (the token
+  cannot see it) stops plan and apply before any write. With no name and
+  both Supabase names already on the Worker, the project is `keep`: not read
+  and not touched, its migrations included. With no name and one of them
+  missing, it stops.
+- Resend key and Stripe webhook: `skip` when the Worker already has
+  `RESEND_API_KEY` or `STRIPE_WEBHOOK_SECRET`, even if the launcher cannot
+  see the key or webhook (one made by hand). Missing, they are made as for a
+  new shop.
+
 ## Running it
 
 Actions > launch > Run workflow, with a shop slug and a mode. The store's
@@ -277,7 +300,10 @@ Names only: no secret value, project ref or webhook id appears in it.
 - `action`: `create`, `skip`, `rotate`, `update` or `blocked` (a read failed,
   usually a missing permission; apply then stops before its first write).
 - `secrets[].state`: `set` or `unchanged`. In a plan, `set` means "would be
-  set".
+  set". With keepExisting it is `set` (missing, added) or `keep` (the Worker
+  has it, never sent), and the summary carries `"keepExisting": true`.
+- `action` `keep` (keepExisting only): the shop's own Supabase project and
+  its migrations, left unread and untouched.
 - `writes`: the launcher's own non-GET calls. A plan is always 0.
 - `exitCode`: 0 ok, 1 failed, 2 refused request (bad mode, slug, missing
   value, live key).

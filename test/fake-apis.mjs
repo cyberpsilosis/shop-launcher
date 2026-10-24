@@ -291,7 +291,7 @@ export async function startFakes(state = newState()) {
       if ((m = q.match(/^\/accounts\/([^/]+)\/workers\/scripts\/([^/]+)\/versions\/([^/]+)$/)) && req.method === 'GET') {
         const ver = (c.versions[m[2]] || []).find((x) => x.id === m[3]);
         if (!ver) return send(404, { success: false });
-        return send(200, { success: true, result: { id: ver.id, resources: { bindings: Object.keys(ver.secrets).map((name) => ({ type: 'secret_text', name })) } } });
+        return send(200, { success: true, result: { id: ver.id, resources: { bindings: [...Object.keys(ver.secrets).map((name) => ({ type: 'secret_text', name })), ...Object.keys(ver.vars || {}).map((name) => ({ type: 'plain_text', name }))] } } });
       }
       // Fake wrangler only: `wrangler deploy` makes a new version holding the
       // earlier version's secrets plus the new ones (as Workers does), and
@@ -302,7 +302,7 @@ export async function startFakes(state = newState()) {
         const cur = vs.find((x) => x.id === c.active[j.worker]);
         const secrets = { ...(cur?.secrets || {}) };
         for (const [k, v] of Object.entries(j.secrets || {})) secrets[k] = createHash('sha256').update(v).digest('hex');
-        const ver = { id: 'ver-' + rnd(6), commit: j.commit || cur?.commit || 'local', secrets };
+        const ver = { id: 'ver-' + rnd(6), commit: j.commit || cur?.commit || 'local', secrets, vars: cur?.vars }; // keep_vars: dashboard variables stay
         vs.push(ver);
         c.active[j.worker] = ver.id;
         (c.history = c.history || {})[j.worker] = [ver.id, ...(c.history[j.worker] || [])];
