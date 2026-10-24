@@ -15,8 +15,12 @@ export function newState() {
     issued: [], // every secret value the fakes handed out, for the leak grep
     supabase: { projects: [], migrations: {}, keys: {}, missingPermissions: null },
     resend: { keys: [] },
-    stripe: { endpoints: [] },
-    cloudflare: { secrets: {}, tokenExpiresOn: null },
+    stripe: { endpoints: [], sessions: [], events: [], refunds: [] },
+    cloudflare: { secrets: {}, versions: {}, active: {}, tokenExpiresOn: null },
+    resendEmails: [],
+    rows: [], // the shop's orders table
+    // The fake shop: what its Worker does with a payment. Tests flip these to force a failure.
+    shop: { webhookAnswers: 200, writeRow: true, sendAlert: true, product: 'orb', pagesFail: [] },
   };
 }
 
@@ -97,6 +101,15 @@ export async function startFakes(state = newState()) {
     }
 
     // ---- Resend ----------------------------------------------------------
+    // ---- Resend emails (read) ---------------------------------------------
+    if (p === '/resend/emails' && req.method === 'GET') {
+      return send(200, { object: 'list', data: state.resendEmails.map(({ html, ...e }) => e) });
+    }
+    if ((m = p.match(/^\/resend\/emails\/([^/]+)$/)) && req.method === 'GET') {
+      const e = state.resendEmails.find((x) => x.id === m[1]);
+      return e ? send(200, e) : send(404, {});
+    }
+
     if (p.startsWith('/resend/')) {
       const r = state.resend;
       const q = p.slice('/resend'.length);
@@ -124,7 +137,7 @@ export async function startFakes(state = newState()) {
       if (q === '/v1/webhook_endpoints' && req.method === 'GET') return send(200, { object: 'list', data: st.endpoints.map(hide) });
       if (q === '/v1/webhook_endpoints' && req.method === 'POST') {
         const f = parseForm(body);
-        const e = { id: 'we_' + rnd(8), object: 'webhook_endpoint', url: f.url, enabled_events: f.enabled_events, metadata: f.metadata, status: 'enabled', secret: 'whsec_' + rnd(16) };
+        const e = { id: 'we_' + rnd(8), created: Math.floor(Date.now() / 1000) + st.endpoints.length, object: 'webhook_endpoint', url: f.url, enabled_events: f.enabled_events, metadata: f.metadata, status: 'enabled', secret: 'whsec_' + rnd(16) };
         state.issued.push(e.secret);
         st.endpoints.push(e);
         return send(200, e);
@@ -141,7 +154,75 @@ export async function startFakes(state = newState()) {
           return send(200, hide(e));
         }
       }
+      if ((m = q.match(/^\/v1\/checkout\/sessions\/([^/]+)$/))) {
+        const ss = st.sessions.find((x) => x.id === m[1]);
+        return ss ? send(200, ss) : send(404, { error: { code: 'resource_missing' } });
+      }
+      if (q === '/v1/events' && req.method === 'GET') {
+        const type = url.searchParams.get('type');
+        return send(200, { object: 'list', data: st.events.filter((e) => !type || e.type === type) });
+      }
+      if (q === '/v1/refunds' && req.method === 'POST') {
+        const f = parseForm(body);
+        const ss = st.sessions.find((x) => x.payment_intent === f.payment_intent);
+        if (!ss) return send(400, { error: { code: 'resource_missing' } });
+        const rf = { id: 're_fake' + rnd(4), object: 'refund', payment_intent: f.payment_intent, status: 'succeeded' };
+        st.refunds.push(rf);
+        return send(200, rf);
+      }
       return send(404, { error: { code: 'resource_missing' } });
+    }
+
+    // ---- The shop's PostgREST ----------------------------------------------
+    if (p === '/rest/v1/orders') {
+      if (!/^sb_secret_/.test(req.headers.apikey || '')) return send(401, { message: 'no service key' });
+      const sid = (url.searchParams.get('stripe_session_id') || '').replace(/^eq\./, '');
+      const hits = state.rows.filter((r) => r.stripe_session_id === sid);
+      if (req.method === 'GET') return send(200, hits);
+      if (req.method === 'PATCH') {
+        const j = JSON.parse(body);
+        for (const r of hits) Object.assign(r, j);
+        res.writeHead(204);
+        return res.end();
+      }
+    }
+
+    // ---- The fake shop (its Worker, served from the active version) ----------
+    if (p.startsWith('/site')) {
+      const q = p.slice('/site'.length) || '/';
+      const w = 'orb-shop';
+      const v = (state.cloudflare.versions[w] || []).find((x) => x.id === state.cloudflare.active[w]);
+      const sh = state.shop;
+      if (q === '/api/version') return send(200, { commit: v?.commit || 'local', branch: 'main', build: 'fake' });
+      if (q === '/api/probe') return send(200, { probe: v?.secrets?.PROBE || null });
+      if (['/', `/shop/${sh.product}`, '/start', '/returns'].includes(q)) return send(sh.pagesFail.includes(q) ? 500 : 200, { page: q });
+      if ((m = q.match(/^\/orders\/([^/]+)$/)) && req.method === 'GET') return send(url.searchParams.get('t') === 'tok' + m[1].slice(-6) ? 200 : 403, {});
+      if ((m = q.match(/^\/api\/orders\/([^/]+)\/ship$/)) && req.method === 'POST') {
+        const f = new URLSearchParams(body);
+        const row = state.rows.find((r) => r.id === m[1]);
+        if (!row || f.get('t') !== 'tok' + m[1].slice(-6)) return send(403, {});
+        Object.assign(row, { status: 'shipped', tracking_number: f.get('tracking_number'), carrier: f.get('carrier'), shipped_email_at: new Date().toISOString() });
+        res.writeHead(303, { location: `/orders/${row.id}?done=sent` });
+        return res.end();
+      }
+      if (q === '/__fake_pay' && req.method === 'POST') {
+        // Stripe Checkout, then Stripe calling the shop's webhook, then the shop's work.
+        const j = JSON.parse(body);
+        const ss = { id: 'cs_test_' + rnd(8), object: 'checkout.session', livemode: false, payment_status: 'paid', payment_intent: 'pi_' + rnd(8), customer_email: j.email };
+        state.stripe.sessions.push(ss);
+        const delivered = sh.webhookAnswers >= 200 && sh.webhookAnswers < 300;
+        state.stripe.events.unshift({ id: 'evt_' + rnd(6), type: 'checkout.session.completed', created: Math.floor(Date.now() / 1000), pending_webhooks: delivered ? 0 : 1, data: { object: { id: ss.id } } });
+        if (delivered && sh.writeRow) {
+          const row = { id: 'ord' + rnd(6), stripe_session_id: ss.id, stripe_payment_intent: ss.payment_intent, status: 'paid', email: j.email, alert_email_at: null, shipped_email_at: null, tracking_number: null, supplier_order_ref: null };
+          state.rows.push(row);
+          if (sh.sendAlert) {
+            row.alert_email_at = new Date().toISOString();
+            state.resendEmails.unshift({ id: 'em_' + rnd(6), subject: 'New order ABC123: buy 1 orb', created_at: new Date().toISOString(), last_event: 'delivered', html: `<a href="${base}/site/orders/${row.id}?t=tok${row.id.slice(-6)}">Add tracking</a>` });
+          }
+        }
+        return send(200, { sessionId: ss.id });
+      }
+      return send(404, {});
     }
 
     // ---- Cloudflare ------------------------------------------------------
@@ -155,13 +236,33 @@ export async function startFakes(state = newState()) {
           if (!w) return send(404, { success: false, errors: [{ code: 10007, message: 'workers.api.error.script_not_found' }] });
           return send(200, { success: true, result: Object.keys(w).map((name) => ({ name, type: 'secret_text' })) });
         }
-        if (req.method === 'PUT') {
-          // Only the fake wrangler calls this, standing in for `wrangler deploy --secrets-file`.
-          const j = JSON.parse(body);
-          c.secrets[m[2]] = c.secrets[m[2]] || {};
-          c.secrets[m[2]][j.name] = createHash('sha256').update(j.text).digest('hex');
-          return send(200, { success: true });
-        }
+      }
+      if ((m = q.match(/^\/accounts\/([^/]+)\/workers\/scripts\/([^/]+)\/deployments$/))) {
+        if (!c.active[m[2]]) return send(404, { success: false });
+        return send(200, { success: true, result: { deployments: [{ id: 'dep', versions: [{ version_id: c.active[m[2]], percentage: 100 }] }] } });
+      }
+      // Fake wrangler only: `wrangler deploy` makes a new version holding the
+      // earlier version's secrets plus the new ones (as Workers does), and
+      // `wrangler rollback <id>` makes an old version active again.
+      if (q === '/fake/deploy' && req.method === 'POST') {
+        const j = JSON.parse(body);
+        const vs = (c.versions[j.worker] = c.versions[j.worker] || []);
+        const cur = vs.find((x) => x.id === c.active[j.worker]);
+        const secrets = { ...(cur?.secrets || {}) };
+        for (const [k, v] of Object.entries(j.secrets || {})) secrets[k] = createHash('sha256').update(v).digest('hex');
+        const ver = { id: 'ver-' + rnd(6), commit: j.commit || cur?.commit || 'local', secrets };
+        vs.push(ver);
+        c.active[j.worker] = ver.id;
+        c.secrets[j.worker] = secrets;
+        return send(200, { success: true, result: { id: ver.id } });
+      }
+      if (q === '/fake/rollback' && req.method === 'POST') {
+        const j = JSON.parse(body);
+        const ver = (c.versions[j.worker] || []).find((x) => x.id === j.version);
+        if (!ver) return send(404, { success: false });
+        c.active[j.worker] = ver.id;
+        c.secrets[j.worker] = ver.secrets;
+        return send(200, { success: true });
       }
       return send(404, { success: false });
     }
@@ -176,6 +277,8 @@ export async function startFakes(state = newState()) {
       LAUNCHER_FAKE_APIS: '1',
       SUPABASE_API_URL: `${base}/supabase`,
       RESEND_API_URL: `${base}/resend`,
+      SUPABASE_REST_URL: base,
+      SHOP_SITE_URL: `${base}/site`,
       STRIPE_API_URL: `${base}/stripe`,
       CLOUDFLARE_API_URL: `${base}/cloudflare`,
       FAKE_CF_URL: `${base}/cloudflare`,
