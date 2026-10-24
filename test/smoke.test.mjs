@@ -18,6 +18,8 @@ import { cloudflare } from '../src/providers.mjs';
 import { markdown } from '../src/launch.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// shops/orb.json as it was before keepExisting: a shop the launcher sets up from nothing.
+const NEW_SHOP = path.join(ROOT, 'test', 'fixtures', 'orb-new-shop.json');
 const LAUNCH = path.join(ROOT, 'src', 'launch.mjs');
 const SECRETS_SH = path.join(ROOT, 'scripts', 'secrets-file.sh');
 const WRANGLER = path.join(ROOT, 'test', 'fake-wrangler.mjs');
@@ -63,7 +65,7 @@ function baseEnv(extra = {}) {
 async function launch(mode, { commit, env = {} } = {}) {
   const summaryJson = path.join(runnerTemp, `summary-${mode}-${Date.now()}.json`);
   const stepSummary = path.join(runnerTemp, `step-${Date.now()}.md`);
-  const args = [LAUNCH, '--shop', 'orb', '--mode', mode, '--shop-dir', shopDir, '--summary-json', summaryJson, '--deploy-cmd', `node ${WRANGLER}`];
+  const args = [LAUNCH, '--shop', 'orb', '--shop-config', NEW_SHOP, '--mode', mode, '--shop-dir', shopDir, '--summary-json', summaryJson, '--deploy-cmd', `node ${WRANGLER}`];
   let file;
   if (mode === 'apply') {
     file = execFileSync(SECRETS_SH, ['create'], { env: { ...process.env, RUNNER_TEMP: runnerTemp }, encoding: 'utf8' }).trim();

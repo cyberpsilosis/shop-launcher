@@ -4,6 +4,7 @@
   "repo": "cyberpsilosis/orb-shop",
   "worker": "orb-shop",
   "siteUrl": "https://orb-shop.elijahedington.workers.dev",
+  "keepExisting": true,
   "supabase": {
     "region": "us-west-1"
   },

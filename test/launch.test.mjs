@@ -16,6 +16,8 @@ import { createHttp, apiBases, PlanWriteRefused } from '../src/http.mjs';
 import { createLog } from '../src/log.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// shops/orb.json as it was before keepExisting: a shop the launcher sets up from nothing.
+const NEW_SHOP = path.join(ROOT, 'test', 'fixtures', 'orb-new-shop.json');
 const LAUNCH = path.join(ROOT, 'src', 'launch.mjs');
 const SECRETS_SH = path.join(ROOT, 'scripts', 'secrets-file.sh');
 const FAKE_WRANGLER = `node ${path.join(ROOT, 'test', 'fake-wrangler.mjs')}`;
@@ -59,7 +61,7 @@ async function launch(mode, { env = {}, secretsFile } = {}) {
   const summaryJson = path.join(runnerTemp, `summary-${mode}-${Date.now()}.json`);
   const stepSummary = path.join(runnerTemp, 'step-summary.md');
   const report = path.join(tmp, `wrangler-${Date.now()}.json`);
-  const args = [LAUNCH, '--shop', 'orb', '--mode', mode, '--shop-dir', shopDir, '--summary-json', summaryJson, '--deploy-cmd', FAKE_WRANGLER];
+  const args = [LAUNCH, '--shop', 'orb', '--shop-config', NEW_SHOP, '--mode', mode, '--shop-dir', shopDir, '--summary-json', summaryJson, '--deploy-cmd', FAKE_WRANGLER];
   if (secretsFile) args.push('--secrets-file', secretsFile);
   const r = await spawnAsync('node', args, {
     env: {

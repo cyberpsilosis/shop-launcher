@@ -235,6 +235,14 @@ export async function run(opts) {
     const storage = shopConfig.storage ?? 'supabase';
     if (!STORAGES.includes(storage)) throw new UsageError(`shops/${shop}.json storage must be ${STORAGES.join(' or ')}`);
     const onD1 = storage === 'd1';
+    // keepExisting: a shop that already runs (the orb). Apply adds only the
+    // Worker names that are missing, overwrites none, and never creates a
+    // Supabase project. Off (the default), apply behaves as it always has.
+    const keepExisting = shopConfig.keepExisting ?? false;
+    if (typeof keepExisting !== 'boolean') throw new UsageError(`shops/${shop}.json keepExisting must be true or false`);
+    const namedProject = shopConfig.supabase?.project;
+    if (namedProject !== undefined && (typeof namedProject !== 'string' || !namedProject)) throw new UsageError(`shops/${shop}.json supabase.project must be the existing project's name`);
+    if (keepExisting) summary.keepExisting = true;
 
     for (const k of [...TOKENS, ...VARIABLES, 'STRIPE_LIVE_KEY']) log.mask(env[k]);
     const needed =
@@ -305,14 +313,36 @@ export async function run(opts) {
       }
     };
 
-    const projectName = `shop-${shop}`;
+    const projectName = namedProject || `shop-${shop}`;
     const keyName = `shop-${shop}`;
     const dbName = `${shop}-orders`;
 
+    // The Worker's names first. keepExisting also counts the active version's
+    // bindings, so a plain variable set in the dashboard (the orb's Supabase
+    // URL) counts as present. Names only: Cloudflare returns no secret value.
+    const cfState = (await read('worker_secrets', () => cf.secretNames(shopConfig.worker))) || { exists: false, names: new Set() };
+    if (keepExisting && cfState.exists) {
+      const active = await read('worker_secrets', () => cf.activeVersion(shopConfig.worker));
+      log.mask(active);
+      if (active) for (const nm of (await read('worker_secrets', () => cf.bindingNames(shopConfig.worker, active))) || []) cfState.names.add(nm);
+    }
+    const has = (name) => cfState.names.has(name);
+
     // Supabase shops: the project and its migration history. D1 shops: the
     // database by name; which migrations it has, wrangler reads in apply
-    // (that read is a POST, which plan never sends).
-    const project = onD1 ? null : await read('supabase_project', () => sb.findProject(projectName, env.SUPABASE_ORG_ID));
+    // (that read is a POST, which plan never sends). keepExisting never
+    // creates a project: it reads the one shops/<slug>.json names, or, with
+    // none named, keeps the project the Worker already points at, unread.
+    const keepUnread = keepExisting && !onD1 && !namedProject && has('NEXT_PUBLIC_SUPABASE_URL') && has('SUPABASE_SERVICE_ROLE_KEY');
+    const project = onD1 || (keepExisting && !namedProject) ? null : await read('supabase_project', () => sb.findProject(projectName, env.SUPABASE_ORG_ID));
+    if (keepExisting && !onD1 && !keepUnread && project === null) {
+      blocked.push({
+        kind: 'supabase_project',
+        message: namedProject
+          ? `the Supabase token cannot see a project named "${namedProject}"; keepExisting never creates one`
+          : `the Worker lacks a Supabase name and shops/${shop}.json names no supabase.project; keepExisting never creates one`,
+      });
+    }
     ref = project ? project.ref || project.id : null;
     log.mask(ref);
     let db = onD1 ? await read('d1_database', () => cf.findD1(dbName)) : null;
@@ -325,19 +355,21 @@ export async function run(opts) {
     }
     const applied = ref ? (await read('supabase_migration', () => sb.listMigrations(ref))) || [] : [];
     const isApplied = (m) => applied.some((a) => a.version === m.version || a.name === m.name || a.name === m.base);
-    const cfState = (await read('worker_secrets', () => cf.secretNames(shopConfig.worker))) || { exists: false, names: new Set() };
     const keys = (await read('resend_key', () => rs.findKeys(keyName))) || [];
     const endpoints = (await read('stripe_webhook', () => st.findEndpoints(webhookUrl, shop))) || [];
     for (const k of keys) log.mask(k.id);
     for (const e of endpoints) log.mask(e.id);
 
-    const has = (name) => cfState.names.has(name);
+    // keepExisting: a key or webhook whose secret the Worker already has is
+    // left alone, even one the launcher cannot see (made by hand).
+    const kept = (name) => keepExisting && has(name);
     const decide = {
-      supabase_project: onD1 ? null : project === undefined ? 'blocked' : project ? 'skip' : 'create',
+      supabase_project: onD1 ? null : keepUnread ? 'keep' : project === undefined ? 'blocked' : project ? 'skip' : 'create',
       d1_database: !onD1 ? null : db === undefined ? 'blocked' : db ? 'skip' : 'create',
-      resend_key: keys.length === 0 ? 'create' : has('RESEND_API_KEY') ? 'skip' : 'rotate',
-      stripe_webhook:
-        endpoints.length === 0
+      resend_key: kept('RESEND_API_KEY') ? 'skip' : keys.length === 0 ? 'create' : has('RESEND_API_KEY') ? 'skip' : 'rotate',
+      stripe_webhook: kept('STRIPE_WEBHOOK_SECRET')
+        ? 'skip'
+        : endpoints.length === 0
           ? 'create'
           : !has('STRIPE_WEBHOOK_SECRET')
             ? 'rotate'
@@ -360,15 +392,16 @@ export async function run(opts) {
     } else {
       summary.resources.push({ kind: 'supabase_project', name: projectName, action: decide.supabase_project, id: ref ? '***' : null });
       for (const m of migrations) {
-        summary.resources.push({ kind: 'supabase_migration', name: m.file, action: decide.supabase_project === 'blocked' ? 'blocked' : isApplied(m) ? 'skip' : 'create' });
+        summary.resources.push({ kind: 'supabase_migration', name: m.file, action: ['blocked', 'keep'].includes(decide.supabase_project) ? decide.supabase_project : isApplied(m) ? 'skip' : 'create' });
       }
     }
     summary.resources.push({ kind: 'resend_key', name: keyName, action: decide.resend_key, permission: 'sending_access' });
     summary.resources.push({ kind: 'stripe_webhook', name: webhookUrl, action: decide.stripe_webhook, events: WEBHOOK_EVENTS, id: endpoints.length ? '***' : null });
 
     const secretsFor = SECRETS.filter((s) => !onD1 || s.from !== 'supabase_project');
-    const toSet = secretsFor.filter((s) => !has(s.name) || ['create', 'rotate'].includes(decide[s.from]));
-    for (const s of secretsFor) summary.secrets.push({ name: s.name, state: toSet.includes(s) ? 'set' : 'unchanged' });
+    // keepExisting sets a name only when the Worker lacks it; every other is "keep".
+    const toSet = secretsFor.filter((s) => !has(s.name) || (!keepExisting && ['create', 'rotate'].includes(decide[s.from])));
+    for (const s of secretsFor) summary.secrets.push({ name: s.name, state: toSet.includes(s) ? 'set' : keepExisting ? 'keep' : 'unchanged' });
     summary.resources.push({
       kind: 'worker_secrets',
       name: shopConfig.worker,
@@ -377,7 +410,7 @@ export async function run(opts) {
     });
 
     for (const r of summary.resources) log.info(`${r.action.padEnd(8)} ${r.kind.padEnd(20)} ${r.name}`);
-    for (const s of summary.secrets) log.info(`secret   ${s.name.padEnd(26)} ${mode === 'plan' && s.state === 'set' ? 'would be set' : s.state}`);
+    for (const s of summary.secrets) log.info(`secret   ${s.name.padEnd(26)} ${mode === 'plan' && s.state === 'set' && !keepExisting ? 'would be set' : s.state}`);
     for (const w of summary.warnings) log.warn(`token ${w.token}: ${w.daysLeft !== undefined ? `expires ${w.expiresOn} (${w.daysLeft} days)` : w.status}`);
     for (const m of summary.missingPermissions) log.error(`${m.provider} token is missing permission: ${m.permission}`);
 
@@ -423,7 +456,7 @@ export async function run(opts) {
         status = (await sb.getProject(ref))?.status;
       }
     }
-    for (const m of onD1 ? [] : migrations) {
+    for (const m of onD1 || decide.supabase_project === 'keep' ? [] : migrations) {
       if (decide.supabase_project === 'skip' && isApplied(m)) continue;
       await sb.applyMigration(ref, { name: m.base, query: fs.readFileSync(m.path, 'utf8') });
       log.info(`applied  supabase_migration   ${m.file}`);
@@ -772,12 +805,13 @@ function parseArgs(argv) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const args = parseArgs(process.argv.slice(2));
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const fake = process.env.LAUNCHER_FAKE_APIS === '1';
   let shopConfig = null;
   if (SLUG.test(args.shop || '')) {
-    const p = path.join(root, 'shops', `${args.shop}.json`);
+    // Tests only: --shop-config points at a fixture in place of shops/<slug>.json.
+    const p = fake && args['shop-config'] ? args['shop-config'] : path.join(root, 'shops', `${args.shop}.json`);
     if (fs.existsSync(p)) shopConfig = JSON.parse(fs.readFileSync(p, 'utf8'));
   }
-  const fake = process.env.LAUNCHER_FAKE_APIS === '1';
   const summary = await run({
     shop: args.shop,
     mode: args.mode,
