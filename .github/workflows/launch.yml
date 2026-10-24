@@ -13,7 +13,7 @@ on:
         type: string
         required: true
       mode:
-        description: plan reads only; apply creates what is missing. smoke, live and rollback are not built yet.
+        description: plan reads only; apply creates what is missing; smoke deploys main, runs the seven checks on test keys and rolls back on a fail. live and rollback are not built yet.
         type: choice
         options: [plan, apply, smoke, live, rollback]
         default: plan
@@ -40,10 +40,9 @@ jobs:
         run: |
           set +x
           case "$MODE" in
-            plan|apply) ;;
-            smoke) echo "::error::mode smoke is not built yet: it arrives with piece 2 of the launcher. Use plan or apply."; exit 1 ;;
-            live|rollback) echo "::error::mode $MODE is not built yet: it arrives with piece 3 of the launcher. Use plan or apply."; exit 1 ;;
-            *) echo "::error::mode must be plan or apply"; exit 1 ;;
+            plan|apply|smoke) ;;
+            live|rollback) echo "::error::mode $MODE is not built yet: it arrives with piece 3 of the launcher. Use plan, apply or smoke."; exit 1 ;;
+            *) echo "::error::mode must be plan, apply or smoke"; exit 1 ;;
           esac
           if ! printf '%s' "$SHOP" | grep -Eq '^[a-z][a-z0-9]{1,30}$'; then
             echo "::error::shop must be 2 to 31 lowercase letters or digits, starting with a letter"; exit 1
@@ -90,6 +89,14 @@ jobs:
           token: ${{ secrets.GH_PROVISION_TOKEN }}
           persist-credentials: false
 
+      # The smoke pays on Stripe's test Checkout in a real browser. The browser
+      # is cached in the runner user's home, so this downloads it once.
+      - name: Install the launcher and its browser (smoke)
+        if: inputs.mode == 'smoke'
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx --no-install playwright install chromium
+
       - name: Make the secrets file (mode 600, under RUNNER_TEMP)
         id: secrets
         if: inputs.mode == 'apply'
@@ -111,7 +118,8 @@ jobs:
         run: |
           set +x
           node src/launch.mjs --shop "$SHOP" --mode "$MODE" --shop-dir shop \
-            --secrets-file "$SECRETS_FILE" --summary-json "$RUNNER_TEMP/summary-$SHOP.json"
+            --secrets-file "$SECRETS_FILE" --summary-json "$RUNNER_TEMP/summary-$SHOP.json" \
+            --expect-commit "$(git -C shop rev-parse HEAD)"
 
       - name: Delete the secrets file
         if: always()

@@ -162,7 +162,7 @@ test('acceptance 2: first apply creates one of each, second apply skips everythi
   assert.equal(fakes.state.stripe.endpoints.length, 1);
 });
 
-test('a lost webhook secret is rotated: new endpoint first, old one deleted after deploy', async () => {
+test('a lost webhook secret is rotated: new endpoint first, old one kept until a green smoke', async () => {
   const oldId = fakes.state.stripe.endpoints[0].id;
   delete fakes.state.cloudflare.secrets['orb-shop'].STRIPE_WEBHOOK_SECRET;
   const f = makeSecretsFile();
@@ -171,8 +171,9 @@ test('a lost webhook secret is rotated: new endpoint first, old one deleted afte
   assert.equal(r.code, 0, r.shown);
   assert.equal(r.summary.resources.find((x) => x.kind === 'stripe_webhook').action, 'rotate');
   assert.deepEqual(r.wrangler.names, ['STRIPE_WEBHOOK_SECRET']);
-  assert.equal(fakes.state.stripe.endpoints.length, 1);
-  assert.notEqual(fakes.state.stripe.endpoints[0].id, oldId);
+  assert.equal(fakes.state.stripe.endpoints.length, 2, 'old webhook kept: no smoke ran');
+  assert.equal(fakes.state.stripe.endpoints[0].id, oldId);
+  assert.deepEqual(r.summary.oldKept, { resend_key: 0, stripe_webhook: 1 });
 });
 
 test('a deploy tool that prints values still leaks nothing', async () => {
@@ -187,8 +188,8 @@ test('a deploy tool that prints values still leaks nothing', async () => {
 });
 
 test('a failed deploy removes the key and webhook it made; the next run rotates cleanly', async () => {
-  const oldKey = fakes.state.resend.keys[0].id;
-  const oldEp = fakes.state.stripe.endpoints[0].id;
+  const oldKeys = fakes.state.resend.keys.map((k) => k.id);
+  const oldEps = fakes.state.stripe.endpoints.map((e) => e.id);
   delete fakes.state.cloudflare.secrets['orb-shop'].RESEND_API_KEY;
   delete fakes.state.cloudflare.secrets['orb-shop'].STRIPE_WEBHOOK_SECRET;
   const f1 = makeSecretsFile();
@@ -196,16 +197,16 @@ test('a failed deploy removes the key and webhook it made; the next run rotates 
   deleteSecretsFile(f1);
   assert.equal(failed.code, 1);
   assert.equal(failed.summary.ok, false);
-  assert.deepEqual(fakes.state.resend.keys.map((k) => k.id), [oldKey], 'new key removed, old key kept');
-  assert.deepEqual(fakes.state.stripe.endpoints.map((e) => e.id), [oldEp], 'new webhook removed, old one kept');
+  assert.deepEqual(fakes.state.resend.keys.map((k) => k.id), oldKeys, 'new key removed, old key kept');
+  assert.deepEqual(fakes.state.stripe.endpoints.map((e) => e.id), oldEps, 'new webhook removed, old one kept');
   const f2 = makeSecretsFile();
   const ok = await launch('apply', { secretsFile: f2 });
   deleteSecretsFile(f2);
   assert.equal(ok.code, 0, ok.shown);
-  assert.equal(fakes.state.resend.keys.length, 1);
-  assert.notEqual(fakes.state.resend.keys[0].id, oldKey);
-  assert.equal(fakes.state.stripe.endpoints.length, 1);
-  assert.notEqual(fakes.state.stripe.endpoints[0].id, oldEp);
+  assert.equal(fakes.state.resend.keys.length, oldKeys.length + 1, 'one new key; the old one waits for a green smoke');
+  assert.ok(!oldKeys.includes(fakes.state.resend.keys.at(-1).id));
+  assert.equal(fakes.state.stripe.endpoints.length, oldEps.length + 1);
+  assert.ok(!oldEps.includes(fakes.state.stripe.endpoints.at(-1).id));
 });
 
 test('plan names a missing Supabase permission and still writes nothing', async () => {
@@ -240,8 +241,8 @@ test('token expiry inside 14 days is a warning', async () => {
   assert.match(r.shown, /::warning::token CLOUDFLARE_API_TOKEN: expires/);
 });
 
-test('smoke, live and rollback are refused with the piece they belong to', async () => {
-  for (const [mode, piece] of [['smoke', 'piece 2'], ['live', 'piece 3'], ['rollback', 'piece 3']]) {
+test('live and rollback are refused with the piece they belong to', async () => {
+  for (const [mode, piece] of [['live', 'piece 3'], ['rollback', 'piece 3']]) {
     const before = fakes.state.requests.length;
     const r = await launch(mode);
     assert.equal(r.code, 2);

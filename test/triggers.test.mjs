@@ -97,6 +97,11 @@ test('launch.yml: inputs, environment, cleanup order', () => {
   // Every checkout drops its credentials.
   for (const s of steps.filter((x) => /actions\/checkout/.test(x.uses || ''))) assert.equal(s.with['persist-credentials'], false);
   // The modes not built yet are refused in the first job, with their piece.
-  assert.match(doc.jobs.check.steps[0].run, /smoke\) echo "::error::mode smoke is not built yet: it arrives with piece 2/);
+  assert.match(doc.jobs.check.steps[0].run, /plan\|apply\|smoke\) ;;/);
+  // The smoke installs its browser only in smoke mode, before the launcher runs.
+  const pw = idx(/^Install the launcher and its browser/);
+  assert.ok(pw >= 0 && pw < runIdx);
+  assert.equal(steps[pw].if, "inputs.mode == 'smoke'");
+  assert.match(steps[runIdx].run, /--expect-commit "\$\(git -C shop rev-parse HEAD\)"/);
   assert.match(doc.jobs.check.steps[0].run, /live\|rollback\) echo "::error::mode \$MODE is not built yet: it arrives with piece 3/);
 });

@@ -9,6 +9,9 @@
     "test": "node --test test/*.test.mjs",
     "check:triggers": "node scripts/check-triggers.mjs .github/workflows"
   },
+  "dependencies": {
+    "playwright": "1.56.1"
+  },
   "devDependencies": {
     "yaml": "2.8.1"
   }
