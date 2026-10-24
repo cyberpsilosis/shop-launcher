@@ -77,29 +77,49 @@ cancels a queued one. GitHub drops a job that waits more than 24 hours.
 Every job here runs on `[self-hosted, shop-launcher]`, so nothing runs until
 this runner exists.
 
-1. Merge pull request #2 (it adds this script). The line below downloads the
-   script from main, so it cannot work before the merge.
+1. Merge pull request #5 (it lets the script bring its own Node). The line
+   below downloads the script from main and checks it is the new one, so it
+   stops with one STOP line if you paste it before the merge.
 2. Open Windows PowerShell on the laptop and paste this one line:
 
 ```powershell
-gh api -X POST repos/cyberpsilosis/shop-launcher/actions/runners/registration-token --jq .token | wsl -u root -- bash -c 'curl -fsLo /root/add-launcher-runner.sh https://raw.githubusercontent.com/cyberpsilosis/shop-launcher/main/scripts/add-launcher-runner.sh || { curl -fsLo /dev/null https://raw.githubusercontent.com/cyberpsilosis/shop-launcher/main/README.md && echo STOP: scripts/add-launcher-runner.sh is not on main yet - merge pull request \#2, then paste this again. Nothing changed. || echo STOP: the laptop cannot reach raw.githubusercontent.com - check it is online, then paste this again. Nothing changed.; exit 1; } && bash /root/add-launcher-runner.sh'
+gh api -X POST repos/cyberpsilosis/shop-launcher/actions/runners/registration-token --jq .token | wsl -u root -- bash -c 'curl -fsLo /root/add-launcher-runner.sh https://raw.githubusercontent.com/cyberpsilosis/shop-launcher/main/scripts/add-launcher-runner.sh || { curl -fsLo /dev/null https://raw.githubusercontent.com/cyberpsilosis/shop-launcher/main/README.md && echo STOP: scripts/add-launcher-runner.sh is not on main yet - merge pull request \#5, then paste this again. Nothing changed. || echo STOP: the laptop cannot reach raw.githubusercontent.com - check it is online, then paste this again. Nothing changed.; exit 1; } && { grep -q SCRIPT_REV=3 /root/add-launcher-runner.sh || { rm -f /root/add-launcher-runner.sh; echo STOP: main still has the older runner script - merge pull request \#5 and wait five minutes, then paste this again. Nothing changed.; exit 1; }; } && bash /root/add-launcher-runner.sh'
 ```
 
 It asks you nothing. `gh` makes a registration token (valid one hour) and
 pipes it straight into the script, so the token is never shown, copied or
 saved. `wsl -u root` runs the script as root without a password prompt. It
-takes about a minute, most of it the runner download. The first run can take
-up to half a minute more while it looks for other runners on the Linux disk.
+takes one to two minutes, most of it the Node and runner downloads. The
+first run can take up to half a minute more while it looks for other
+runners on the Linux disk.
+
+Node does not need to be installed. The script downloads Node v24.21.0 from
+nodejs.org into `/home/ci-shop-launcher/node`, checks it against the SHA-256
+written in the script, and points only this runner at it. Root's PATH, nvm
+and the other runners' Node are not used or changed. It needs no `jq`.
 
 Every way it can end:
 
 - `Done: runner laptop-shop-launcher (label shop-launcher) runs as
   ci-shop-launcher.` The runner shows as Idle under Settings > Actions >
   Runners, and the queued `test` runs start.
-- `STOP: scripts/add-launcher-runner.sh is not on main yet - merge pull
-  request #2, then paste this again. Nothing changed.` Step 1 was skipped.
+- `STOP: main still has the older runner script - merge pull request #5 and
+  wait five minutes, then paste this again. Nothing changed.` Step 1 was
+  skipped, or GitHub still serves the old copy (it caches for up to five
+  minutes after a merge).
+- `STOP: scripts/add-launcher-runner.sh is not on main yet - ...`: the same
+  fix, merge #5.
 - `STOP: the laptop cannot reach raw.githubusercontent.com - check it is
   online, then paste this again. Nothing changed.`
+- `STOP: WSL is missing curl, sudo; nothing changed. To fix it, paste this one
+  line in PowerShell, then paste the setup line again:` and under it the line,
+  for example `wsl -u root -- sh -c "apt-get update && apt-get install -y curl
+  sudo"`. It names every missing tool at once, so one fix covers them all.
+- `STOP: systemd is not running in WSL, ...` and under it the fix line, which
+  switches systemd on in `/etc/wsl.conf` and restarts WSL:
+  `wsl -u root -- sh -c "printf '\n[boot]\nsystemd=true\n' >> /etc/wsl.conf"; wsl --shutdown`.
+  If `/etc/wsl.conf` already switches it on, the line is only `wsl --shutdown`.
+  Restarting WSL also restarts the laptop's other runners.
 - `STOP: no registration token came in from gh - ...` or `STOP: what came in
   from gh is not a runner registration token - ...`: run `gh auth status` in
   PowerShell; the account must be admin on this repository.
@@ -109,6 +129,8 @@ Every way it can end:
 
 What the script does (`scripts/add-launcher-runner.sh`):
 
+- Checks every tool it needs (curl, tar, gzip, sha256sum, systemctl, sudo and
+  the basic ones) and that systemd runs WSL, before it changes anything.
 - Stops with `STOP: ...; nothing changed` if the `ci-shop-launcher` user or
   its home exists, if a shop-launcher runner service is installed, or if a
   runner already registered to this repository is anywhere on the Linux disk
@@ -118,12 +140,16 @@ What the script does (`scripts/add-launcher-runner.sh`):
   It walks the whole Linux disk, not the Windows drives under `/mnt`.
 - Makes user `ci-shop-launcher`: its own group only, no password, no sudo,
   home mode 750. The other runners' users cannot read its folder.
+- Puts Node v24.21.0 (with npm) in `/home/ci-shop-launcher/node`, owned by
+  root, after its pinned SHA-256 matches.
 - Downloads GitHub's runner, checks its published SHA-256, and puts it in
   `/home/ci-shop-launcher/actions-runner`.
-- Registers it as `laptop-shop-launcher`, label `shop-launcher`, and starts
-  it as a systemd service running as that user. The token goes to GitHub's
-  `config.sh` through its environment (`ACTIONS_RUNNER_INPUT_TOKEN`), never
-  on a command line, so `ps` cannot show it to another user.
+- Registers it as `laptop-shop-launcher`, label `shop-launcher`, writes the
+  runner's `.path` with that Node first, checks that `ci-shop-launcher` finds
+  it, and starts the runner as a systemd service running as that user. The
+  token goes to GitHub's `config.sh` through its environment
+  (`ACTIONS_RUNNER_INPUT_TOKEN`), never on a command line, so `ps` cannot
+  show it to another user.
 
 To try it on a scratch machine without registering anything:
 `sudo LAUNCHER_RUNNER_NO_REGISTER=1 bash scripts/add-launcher-runner.sh`. It
@@ -131,7 +157,7 @@ makes the user and the empty runner folder and stops.
 
 To undo: in `/home/ci-shop-launcher/actions-runner` run `sudo ./svc.sh stop`
 and `sudo ./svc.sh uninstall`, delete the runner under Settings > Actions >
-Runners, then `sudo userdel -r ci-shop-launcher`.
+Runners, then `sudo userdel -r ci-shop-launcher` (that removes its Node too).
 
 ## Can a stranger reach the laptop?
 
