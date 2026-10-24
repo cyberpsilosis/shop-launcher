@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 
 export const ALLOWED = ['workflow_dispatch', 'push'];
+export const SECRET_ENVIRONMENTS = ['provision', 'live'];
 
 function triggers(doc) {
   const on = doc?.on ?? doc?.[true]; // YAML 1.1 readers turn `on` into true
@@ -49,9 +50,14 @@ export function checkWorkflow(file, text) {
       problems.push(`${name}: job ${id} must run on the laptop runner (self-hosted); GitHub-hosted runners do not start on this account`);
     }
     const body = JSON.stringify(job);
-    if (/\$\{\{\s*secrets[.[]/.test(body) && job.environment !== 'provision' && job.environment?.name !== 'provision') {
-      problems.push(`${name}: job ${id} reads secrets outside the provision environment`);
+    const env = job?.environment?.name ?? job?.environment;
+    if (/\$\{\{\s*secrets[.[]/.test(body) && !SECRET_ENVIRONMENTS.includes(env)) {
+      problems.push(`${name}: job ${id} reads secrets outside the provision and live environments`);
     }
+    // The live key is gated by Elijah's approval of the `live` environment:
+    // no other job may name it, and the live job runs for live and rollback only.
+    if (/STRIPE_RK_LIVE/.test(body) && env !== 'live') problems.push(`${name}: job ${id} names the live Stripe key outside the live environment`);
+    if (env === 'live' && !/inputs\.mode == 'live'/.test(String(job.if))) problems.push(`${name}: job ${id} in the live environment needs an if on inputs.mode`);
   }
 
   if (name === 'launch.yml') {

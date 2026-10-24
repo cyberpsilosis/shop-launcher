@@ -13,8 +13,23 @@ import { createHttp, apiBases, HttpError, PlanWriteRefused } from './http.mjs';
 import { supabase, resend, stripe, cloudflare, WEBHOOK_EVENTS } from './providers.mjs';
 import { runSmoke, CHECKS } from './smoke.mjs';
 
-export const MODES = ['plan', 'apply', 'smoke'];
-export const LATER_MODES = { live: 'piece 3', rollback: 'piece 3' };
+export const MODES = ['plan', 'apply', 'smoke', 'live', 'rollback'];
+export const LATER_MODES = {};
+// rollback runs in two jobs: `worker` (environment provision, no approval)
+// returns the Worker to its test-key version; `endpoint` (environment live,
+// after Elijah's approval) disables the live webhook endpoint.
+export const ROLLBACK_STEPS = ['worker', 'endpoint'];
+// A secret whose name marks a Worker version as running on the live key.
+// Cloudflare lists binding names per version, so the launcher can tell a
+// live version from a test-key one without reading any value.
+export const LIVE_MARK = 'SHOP_LAUNCHER_LIVE';
+// What each mode needs from the environment. Only live and rollback/endpoint
+// see the live key, and those run only in the `live` environment.
+const NEEDS = {
+  live: ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'STRIPE_LIVE_KEY'],
+  'rollback/worker': ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID'],
+  'rollback/endpoint': ['STRIPE_LIVE_KEY'],
+};
 export const SLUG = /^[a-z][a-z0-9]{1,30}$/;
 export const TOKENS = ['SUPABASE_ACCESS_TOKEN', 'RESEND_ADMIN_KEY', 'STRIPE_SECRET_KEY', 'CLOUDFLARE_API_TOKEN'];
 export const VARIABLES = ['SUPABASE_ORG_ID', 'CLOUDFLARE_ACCOUNT_ID'];
@@ -113,6 +128,7 @@ export async function run(opts) {
     runId,
     smokeSleep,
     smokeTries,
+    step = 'worker',
   } = opts;
 
   const summary = {
@@ -138,16 +154,21 @@ export async function run(opts) {
     if (mode in LATER_MODES) {
       throw new UsageError(`mode "${mode}" is not built yet: it arrives with ${LATER_MODES[mode]} of the launcher. Use plan, apply or smoke.`);
     }
-    if (!MODES.includes(mode)) throw new UsageError(`mode must be plan, apply or smoke`);
+    if (!MODES.includes(mode)) throw new UsageError(`mode must be ${MODES.join(', ')}`);
+    if (mode === 'rollback' && !ROLLBACK_STEPS.includes(step)) throw new UsageError(`rollback --step must be ${ROLLBACK_STEPS.join(' or ')}`);
     if (!SLUG.test(shop || '')) throw new UsageError('shop must be 2 to 31 lowercase letters or digits, starting with a letter');
     if (!shopConfig || shopConfig.slug !== shop) throw new UsageError(`shops/${shop}.json is missing or names another slug`);
 
-    for (const k of [...TOKENS, ...VARIABLES]) log.mask(env[k]);
-    const missing = [...TOKENS, ...VARIABLES].filter((k) => !env[k]);
+    for (const k of [...TOKENS, ...VARIABLES, 'STRIPE_LIVE_KEY']) log.mask(env[k]);
+    const needed = NEEDS[mode === 'rollback' ? `rollback/${step}` : mode] || [...TOKENS, ...VARIABLES];
+    const missing = needed.filter((k) => !env[k]);
     if (missing.length) throw new UsageError(`missing environment values: ${missing.join(', ')}`);
-    if (/^[rs]k_live_/.test(env.STRIPE_SECRET_KEY)) {
-      throw new UsageError('STRIPE_SECRET_KEY is a live-mode key; the launcher uses test keys only until the live mode (piece 3) exists');
+    if (/^[rs]k_live_/.test(env.STRIPE_SECRET_KEY || '')) {
+      throw new UsageError('STRIPE_SECRET_KEY is a live-mode key; plan, apply and smoke use test keys only (the live key arrives as STRIPE_LIVE_KEY in mode=live)');
     }
+    const liveKeyMode = mode === 'live' || (mode === 'rollback' && step === 'endpoint');
+    if (env.STRIPE_LIVE_KEY && !liveKeyMode) throw new UsageError(`STRIPE_LIVE_KEY reached mode ${mode}${mode === 'rollback' ? `/${step}` : ''}; only live and rollback/endpoint may see it`);
+    if (liveKeyMode && !/^rk_live_/.test(env.STRIPE_LIVE_KEY)) throw new UsageError('STRIPE_LIVE_KEY must be a restricted live-mode key, not a secret key');
 
     const bases = apiBases(env);
     http = createHttp({ mode, fetchImpl });
@@ -156,6 +177,17 @@ export async function run(opts) {
     const st = stripe(http, bases.stripe, env);
     const cf = cloudflare(http, bases.cloudflare, env);
     const n = now();
+    let ref = null;
+    const siteUrl = () => {
+      const o = env.LAUNCHER_FAKE_APIS === '1' && env.SHOP_SITE_URL;
+      if (o && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(o)) throw new UsageError('SHOP_SITE_URL may only point at localhost');
+      return (o || shopConfig.siteUrl).replace(/\/$/, '');
+    };
+    const webhookUrl = `${shopConfig.siteUrl.replace(/\/$/, '')}/api/stripe/webhook`;
+    const isLive = async (versionId) => (await cf.bindingNames(shopConfig.worker, versionId)).has(LIVE_MARK);
+
+    if (mode === 'live') return await goLive();
+    if (mode === 'rollback') return step === 'worker' ? await rollbackWorker() : await disableLiveEndpoints();
 
     // Token expiry. Cloudflare says it itself; the others come from optional
     // repository variables <TOKEN>_EXPIRES_ON (an ISO date, not a secret).
@@ -194,17 +226,11 @@ export async function run(opts) {
       }
     };
 
-    const siteUrl = () => {
-      const o = env.LAUNCHER_FAKE_APIS === '1' && env.SHOP_SITE_URL;
-      if (o && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(o)) throw new UsageError('SHOP_SITE_URL may only point at localhost');
-      return (o || shopConfig.siteUrl).replace(/\/$/, '');
-    };
     const projectName = `shop-${shop}`;
     const keyName = `shop-${shop}`;
-    const webhookUrl = `${shopConfig.siteUrl.replace(/\/$/, '')}/api/stripe/webhook`;
 
     const project = await read('supabase_project', () => sb.findProject(projectName, env.SUPABASE_ORG_ID));
-    let ref = project ? project.ref || project.id : null;
+    ref = project ? project.ref || project.id : null;
     log.mask(ref);
     const migrations = readMigrations(shopDir ? path.join(shopDir, 'supabase', 'migrations') : null);
     const applied = ref ? (await read('supabase_migration', () => sb.listMigrations(ref))) || [] : [];
@@ -389,19 +415,128 @@ export async function run(opts) {
       const id = await cf.activeVersion(shopConfig.worker);
       log.mask(id);
       const v = await fetch(`${siteUrl()}/api/version`).then((r) => r.json()).catch(() => null);
-      const rec = { id, commit: v?.commit || null };
-      log.info(`recorded the live Worker version (${rec.commit ? rec.commit.slice(0, 7) : 'no commit'}) before deploy`);
+      const rec = { id, commit: v?.commit || null, live: id ? await isLive(id) : false };
+      // smoke and apply deploy test keys: never on top of a live version.
+      if (rec.live && mode !== 'live') throw new Error('the shop is on its live key; run mode=rollback before apply or smoke');
+      log.info(`recorded the active Worker version (${rec.commit ? rec.commit.slice(0, 7) : 'no commit'}${rec.live ? ', live key' : ''}) before deploy`);
       return rec;
     }
 
-    async function smokeOrRollback(prev) {
-      if (!browser) throw new Error('smoke needs a browser (Playwright)');
+    // ---- live and rollback ------------------------------------------------------
+    // Live: one new Worker version with the live restricted key and a new live
+    // webhook endpoint's secret. It goes up only on the commit the last smoke
+    // proved, and only on top of a test-key version. Then check 1 of the smoke
+    // (no test card on a live key); if that fails it rolls back on its own.
+    async function goLive() {
+      const stl = stripe(http, bases.stripe, { STRIPE_SECRET_KEY: env.STRIPE_LIVE_KEY });
+      const prev = await recordActive();
+      if (!prev.id) throw new Error('the Worker has no version yet: run apply and a green smoke first');
+      if (prev.live) {
+        summary.resources.push({ kind: 'worker_version', name: shopConfig.worker, action: 'skip', key: 'live' });
+        log.info(`skip     worker_version       ${shopConfig.worker} is on its live key already`);
+        summary.ok = true;
+        exitCode = 0;
+        return summary;
+      }
+      if (!expectCommit || prev.commit !== expectCommit) {
+        throw new Error(`the active version runs ${String(prev.commit).slice(0, 7)}, main is ${String(expectCommit).slice(0, 7)}: run a green smoke on main before going live`);
+      }
+      const old = await stl.findEndpoints(webhookUrl, shop);
+      for (const e of old) log.mask(e.id);
+      const ep = await stl.createEndpoint(webhookUrl, shop);
+      log.mask(ep.id);
+      log.mask(ep.secret);
+      summary.resources.push({ kind: 'stripe_webhook', name: webhookUrl, action: 'create', livemode: true, id: '***' });
+      try {
+        await deploy({ STRIPE_SECRET_KEY: env.STRIPE_LIVE_KEY, STRIPE_WEBHOOK_SECRET: ep.secret, [LIVE_MARK]: '1' });
+      } catch (e) {
+        await stl.deleteEndpoint(ep.id).catch(() => log.warn('could not remove the new live webhook; rollback/endpoint disables it'));
+        throw e;
+      }
+      summary.resources.push({ kind: 'worker_version', name: shopConfig.worker, action: 'create', key: 'live' });
+      if (!(await smokeOrRollback(prev, ['pages']))) {
+        await stl.deleteEndpoint(ep.id).catch(() => log.warn('could not remove the new live webhook; rollback/endpoint disables it'));
+        return summary;
+      }
+      // Endpoints left from an earlier live run (disabled by its rollback): their
+      // secret is on no version any more.
+      for (const e of old) await stl.deleteEndpoint(e.id);
+      if (old.length) log.info(`deleted  ${old.length} earlier live webhook(s)`);
+      log.info(`live     ${shopConfig.worker} is on its live key`);
+      summary.ok = true;
+      exitCode = 0;
+      return summary;
+    }
+
+    // Rollback, job 1: back to the newest version that is not on the live key.
+    // Its bindings are the test key and the test webhook secret (a version keeps
+    // its secrets), so live checkout stops at once.
+    async function rollbackWorker() {
+      const active = await cf.activeVersion(shopConfig.worker);
+      log.mask(active);
+      if (!active) throw new Error('the Worker has no version to roll back');
+      if (!(await isLive(active))) {
+        summary.resources.push({ kind: 'worker_version', name: shopConfig.worker, action: 'skip', key: 'test' });
+        log.info(`skip     worker_version       ${shopConfig.worker} is on a test-key version already`);
+        summary.ok = true;
+        exitCode = 0;
+        return summary;
+      }
+      let target = null;
+      for (const id of await cf.deployedVersions(shopConfig.worker)) {
+        log.mask(id);
+        if (!(await isLive(id))) {
+          target = id;
+          break;
+        }
+      }
+      if (!target) throw new Error('no test-key version in the deployment history');
+      const fake = env.LAUNCHER_FAKE_APIS === '1' && deployCmd;
+      if (!fake && shopConfig.install) await runCommand(shopConfig.install, { cwd: shopDir, env: childEnv(env), log });
+      await wranglerRollback(target, `shop-launcher rollback ${runId || ''}`.trim());
+      const now = await cf.activeVersion(shopConfig.worker);
+      const back = now === target && !(await isLive(now));
+      summary.rollback = { ok: back, to: '***', detail: back ? 'back on the test-key version' : 'wrangler rollback ran, but the active version is not the test-key one' };
+      summary.resources.push({ kind: 'worker_version', name: shopConfig.worker, action: back ? 'rollback' : 'blocked', key: 'test' });
+      log.info(`${back ? 'rollback' : 'FAIL    '} worker_version       ${summary.rollback.detail}`);
+      summary.ok = back;
+      exitCode = back ? 0 : 1;
+      return summary;
+    }
+
+    // Rollback, job 2 (environment live): Stripe stops sending live events.
+    async function disableLiveEndpoints() {
+      const stl = stripe(http, bases.stripe, { STRIPE_SECRET_KEY: env.STRIPE_LIVE_KEY });
+      const eps = await stl.findEndpoints(webhookUrl, shop);
+      for (const e of eps) log.mask(e.id);
+      let n = 0;
+      for (const e of eps) {
+        if (e.status === 'disabled') continue;
+        await stl.disableEndpoint(e.id);
+        n++;
+      }
+      summary.resources.push({ kind: 'stripe_webhook', name: webhookUrl, action: n ? 'disable' : 'skip', livemode: true, count: n });
+      log.info(`${n ? 'disable ' : 'skip    '} stripe_webhook       ${n} live endpoint(s) disabled, ${eps.length - n} already off`);
+      summary.ok = true;
+      exitCode = 0;
+      return summary;
+    }
+
+    async function wranglerRollback(id, message) {
+      const fake = env.LAUNCHER_FAKE_APIS === '1' && deployCmd;
+      const cmd = fake ? [...deployCmd, 'rollback', id] : ['npx', '--no-install', 'wrangler', 'rollback', id, '--name', shopConfig.worker, '--message', message];
+      log.info('running  wrangler rollback to the recorded version');
+      await runCommand(cmd, { cwd: shopDir, env: childEnv(env, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID }), log });
+    }
+
+    async function smokeOrRollback(prev, only) {
+      if (!browser && !only) throw new Error('smoke needs a browser (Playwright)');
       summary.checks = await runSmoke({
         http, bases, env, shopConfig: { ...shopConfig, siteUrl: siteUrl() }, expectCommit, browser, sb, supabaseRef: ref, log, runId,
-        sleep: smokeSleep, tries: smokeTries,
+        sleep: smokeSleep, tries: smokeTries, only,
       });
       for (const c of summary.checks) log.info(`${c.ok ? 'pass' : c.skipped ? 'skip' : 'FAIL'}     ${c.title}: ${c.detail}`);
-      const green = summary.checks.length === CHECKS.length && summary.checks.every((c) => c.ok);
+      const green = summary.checks.length === (only || CHECKS).length && summary.checks.every((c) => c.ok);
       if (green) return true;
       const failed = summary.checks.find((c) => !c.ok && !c.skipped);
       summary.errors.push(`smoke failed at "${failed.title}": ${failed.detail}`);
@@ -409,13 +544,8 @@ export async function run(opts) {
         summary.rollback = { ok: false, detail: 'no earlier version to roll back to' };
         return false;
       }
-      const fake = env.LAUNCHER_FAKE_APIS === '1' && deployCmd;
-      const cmd = fake
-        ? [...deployCmd, 'rollback', prev.id]
-        : ['npx', '--no-install', 'wrangler', 'rollback', prev.id, '--name', shopConfig.worker, '--message', `shop-launcher smoke failed ${runId || ''}`.trim()];
       try {
-        log.info('running  wrangler rollback to the recorded version');
-        await runCommand(cmd, { cwd: shopDir, env: childEnv(env, { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID }), log });
+        await wranglerRollback(prev.id, `shop-launcher ${mode === 'live' ? 'live check' : 'smoke'} failed ${runId || ''}`.trim());
         const v = await fetch(`${siteUrl()}/api/version`).then((r) => r.json()).catch(() => null);
         const back = !prev.commit || v?.commit === prev.commit;
         summary.rollback = { ok: back, to: '***', commit: v?.commit ? v.commit.slice(0, 7) : null, detail: back ? `rolled back; /api/version is ${String(v?.commit).slice(0, 7)} again` : `rolled back, but /api/version says ${String(v?.commit).slice(0, 7)}` };
@@ -521,6 +651,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     deployCmd: fake && args['deploy-cmd'] ? args['deploy-cmd'].split(' ') : undefined,
     pollMs: fake ? 0 : 5000,
     expectCommit: args['expect-commit'],
+    step: args.step,
     runId: process.env.GITHUB_RUN_ID,
     smokeSleep: fake ? async () => {} : undefined,
     browser:

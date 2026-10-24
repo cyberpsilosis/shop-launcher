@@ -13,7 +13,7 @@ on:
         type: string
         required: true
       mode:
-        description: plan reads only; apply creates what is missing; smoke deploys main, runs the seven checks on test keys and rolls back on a fail. live and rollback are not built yet.
+        description: plan reads only; apply creates what is missing; smoke deploys main, runs the seven checks on test keys and rolls back on a fail; live switches to the live key after Elijah approves the live environment; rollback returns the test-key version, then (after his approval) disables the live webhook.
         type: choice
         options: [plan, apply, smoke, live, rollback]
         default: plan
@@ -33,16 +33,15 @@ jobs:
     runs-on: [self-hosted, shop-launcher]
     timeout-minutes: 5
     steps:
-      - name: Refuse modes not built yet, bad slugs and other branches
+      - name: Refuse unknown modes, bad slugs and other branches
         env:
           MODE: ${{ inputs.mode }}
           SHOP: ${{ inputs.shop }}
         run: |
           set +x
           case "$MODE" in
-            plan|apply|smoke) ;;
-            live|rollback) echo "::error::mode $MODE is not built yet: it arrives with piece 3 of the launcher. Use plan, apply or smoke."; exit 1 ;;
-            *) echo "::error::mode must be plan, apply or smoke"; exit 1 ;;
+            plan|apply|smoke|live|rollback) ;;
+            *) echo "::error::mode must be plan, apply, smoke, live or rollback"; exit 1 ;;
           esac
           if ! printf '%s' "$SHOP" | grep -Eq '^[a-z][a-z0-9]{1,30}$'; then
             echo "::error::shop must be 2 to 31 lowercase letters or digits, starting with a letter"; exit 1
@@ -52,9 +51,12 @@ jobs:
           fi
           echo "ok: $MODE $SHOP"
 
+  # plan, apply, smoke, and rollback's first job (the Worker back to its
+  # test-key version). Never live: this job cannot see the live key.
   launch:
-    name: ${{ inputs.mode }} ${{ inputs.shop }}
+    name: ${{ inputs.mode == 'rollback' && 'rollback worker' || inputs.mode }} ${{ inputs.shop }}
     needs: check
+    if: inputs.mode != 'live'
     runs-on: [self-hosted, shop-launcher]
     # Secrets live in this environment, readable from main only (set up by Elijah).
     environment: provision
@@ -117,7 +119,7 @@ jobs:
           SECRETS_FILE: ${{ steps.secrets.outputs.file }}
         run: |
           set +x
-          node src/launch.mjs --shop "$SHOP" --mode "$MODE" --shop-dir shop \
+          node src/launch.mjs --shop "$SHOP" --mode "$MODE" --step worker --shop-dir shop \
             --secrets-file "$SECRETS_FILE" --summary-json "$RUNNER_TEMP/summary-$SHOP.json" \
             --expect-commit "$(git -C shop rev-parse HEAD)"
 
@@ -137,6 +139,100 @@ jobs:
           retention-days: 30
 
       # Last: a self-hosted runner keeps its disk between jobs.
+      - name: Clear RUNNER_TEMP and the shop checkout
+        if: always()
+        run: |
+          rm -rf shop
+          scripts/secrets-file.sh clear
+
+  # The only job that can read the live key. Environment `live`: main only,
+  # required reviewer Elijah. GitHub holds this job in "Waiting" until he taps
+  # Approve; until then no runner picks it up and no step or secret is read.
+  # An approval tapped at night queues for the laptop runner and starts when
+  # Elijah logs in (GitHub fails a job still queued 24 hours after approval).
+  # mode=live: switch the Worker to the live key as its own version.
+  # mode=rollback: after the launch job put the test-key version back,
+  # disable the live webhook endpoint.
+  live:
+    name: ${{ inputs.mode == 'live' && 'live' || 'rollback live webhook' }} ${{ inputs.shop }}
+    needs: [check, launch]
+    if: >-
+      !cancelled() && needs.check.result == 'success' &&
+      ((inputs.mode == 'live' && needs.launch.result == 'skipped') ||
+       (inputs.mode == 'rollback' && needs.launch.result == 'success'))
+    runs-on: [self-hosted, shop-launcher]
+    environment: live
+    timeout-minutes: 30
+    env:
+      SHOP: ${{ inputs.shop }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read the shop's config
+        id: shop
+        run: |
+          set +x
+          node -e '
+            const fs = require("fs");
+            const f = `shops/${process.env.SHOP}.json`;
+            if (!fs.existsSync(f)) { console.log(`::error::no ${f}`); process.exit(1); }
+            const c = JSON.parse(fs.readFileSync(f, "utf8"));
+            if (c.slug !== process.env.SHOP || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(c.repo || "")) { console.log("::error::bad shop config"); process.exit(1); }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `repo=${c.repo}\n`);
+          '
+
+      - name: Check out the shop's main (live)
+        if: inputs.mode == 'live'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.shop.outputs.repo }}
+          ref: main
+          path: shop
+          token: ${{ secrets.GH_PROVISION_TOKEN }}
+          persist-credentials: false
+
+      - name: Make the secrets file (mode 600, under RUNNER_TEMP)
+        id: secrets
+        if: inputs.mode == 'live'
+        run: |
+          set +x
+          echo "file=$(scripts/secrets-file.sh create)" >> "$GITHUB_OUTPUT"
+
+      - name: Run the launcher
+        env:
+          STRIPE_LIVE_KEY: ${{ secrets[format('STRIPE_RK_LIVE__{0}', inputs.shop)] }}
+          CLOUDFLARE_API_TOKEN: ${{ inputs.mode == 'live' && secrets.CLOUDFLARE_API_TOKEN || '' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          SECRETS_FILE: ${{ steps.secrets.outputs.file }}
+        run: |
+          set +x
+          if [ "$MODE" = live ]; then
+            node src/launch.mjs --shop "$SHOP" --mode live --shop-dir shop \
+              --secrets-file "$SECRETS_FILE" --summary-json "$RUNNER_TEMP/summary-$SHOP.json" \
+              --expect-commit "$(git -C shop rev-parse HEAD)"
+          else
+            node src/launch.mjs --shop "$SHOP" --mode rollback --step endpoint \
+              --summary-json "$RUNNER_TEMP/summary-$SHOP.json"
+          fi
+
+      - name: Delete the secrets file
+        if: always()
+        env:
+          SECRETS_FILE: ${{ steps.secrets.outputs.file }}
+        run: scripts/secrets-file.sh delete "$SECRETS_FILE"
+
+      - name: Upload the summary JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: launch-summary-${{ inputs.shop }}-${{ inputs.mode }}-live-${{ github.run_id }}
+          path: ${{ runner.temp }}/summary-${{ inputs.shop }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Clear RUNNER_TEMP and the shop checkout
         if: always()
         run: |

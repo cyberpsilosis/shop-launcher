@@ -134,23 +134,29 @@ export async function startFakes(state = newState()) {
       const st = state.stripe;
       const q = p.slice('/stripe'.length);
       const hide = ({ secret, ...e }) => e; // Stripe shows the secret only on create
-      if (q === '/v1/webhook_endpoints' && req.method === 'GET') return send(200, { object: 'list', data: st.endpoints.map(hide) });
+      // Test and live mode are separate worlds in one account: a key sees only its own mode's endpoints.
+      const livemode = /^Bearer rk_live_/.test(req.headers.authorization || '');
+      if (livemode) state.liveKeyCalls = (state.liveKeyCalls || 0) + 1;
+      const mine = (e) => !!e.livemode === livemode;
+      if (q === '/v1/webhook_endpoints' && req.method === 'GET') return send(200, { object: 'list', data: st.endpoints.filter(mine).map(hide) });
       if (q === '/v1/webhook_endpoints' && req.method === 'POST') {
         const f = parseForm(body);
-        const e = { id: 'we_' + rnd(8), created: Math.floor(Date.now() / 1000) + st.endpoints.length, object: 'webhook_endpoint', url: f.url, enabled_events: f.enabled_events, metadata: f.metadata, status: 'enabled', secret: 'whsec_' + rnd(16) };
+        const e = { id: 'we_' + rnd(8), created: Math.floor(Date.now() / 1000) + st.endpoints.length, object: 'webhook_endpoint', url: f.url, enabled_events: f.enabled_events, metadata: f.metadata, status: 'enabled', livemode, secret: 'whsec_' + rnd(16) };
         state.issued.push(e.secret);
         st.endpoints.push(e);
         return send(200, e);
       }
       if ((m = q.match(/^\/v1\/webhook_endpoints\/([^/]+)$/))) {
-        const e = st.endpoints.find((x) => x.id === m[1]);
+        const e = st.endpoints.find((x) => x.id === m[1] && mine(x));
         if (!e) return send(404, { error: { code: 'resource_missing' } });
         if (req.method === 'DELETE') {
           st.endpoints = st.endpoints.filter((x) => x.id !== m[1]);
           return send(200, { id: m[1], deleted: true });
         }
         if (req.method === 'POST') {
-          e.enabled_events = parseForm(body).enabled_events;
+          const f = parseForm(body);
+          if (f.disabled !== undefined) e.status = f.disabled === 'true' ? 'disabled' : 'enabled';
+          if (f.enabled_events.length) e.enabled_events = f.enabled_events;
           return send(200, hide(e));
         }
       }
@@ -239,7 +245,14 @@ export async function startFakes(state = newState()) {
       }
       if ((m = q.match(/^\/accounts\/([^/]+)\/workers\/scripts\/([^/]+)\/deployments$/))) {
         if (!c.active[m[2]]) return send(404, { success: false });
-        return send(200, { success: true, result: { deployments: [{ id: 'dep', versions: [{ version_id: c.active[m[2]], percentage: 100 }] }] } });
+        // Newest first, as Cloudflare lists them; a rollback is a deployment too.
+        const ids = c.history?.[m[2]] || [c.active[m[2]]];
+        return send(200, { success: true, result: { deployments: ids.map((id, i) => ({ id: 'dep' + i, versions: [{ version_id: id, percentage: 100 }] })) } });
+      }
+      if ((m = q.match(/^\/accounts\/([^/]+)\/workers\/scripts\/([^/]+)\/versions\/([^/]+)$/)) && req.method === 'GET') {
+        const ver = (c.versions[m[2]] || []).find((x) => x.id === m[3]);
+        if (!ver) return send(404, { success: false });
+        return send(200, { success: true, result: { id: ver.id, resources: { bindings: Object.keys(ver.secrets).map((name) => ({ type: 'secret_text', name })) } } });
       }
       // Fake wrangler only: `wrangler deploy` makes a new version holding the
       // earlier version's secrets plus the new ones (as Workers does), and
@@ -253,6 +266,7 @@ export async function startFakes(state = newState()) {
         const ver = { id: 'ver-' + rnd(6), commit: j.commit || cur?.commit || 'local', secrets };
         vs.push(ver);
         c.active[j.worker] = ver.id;
+        (c.history = c.history || {})[j.worker] = [ver.id, ...(c.history[j.worker] || [])];
         c.secrets[j.worker] = secrets;
         return send(200, { success: true, result: { id: ver.id } });
       }
@@ -262,6 +276,7 @@ export async function startFakes(state = newState()) {
         if (!ver) return send(404, { success: false });
         c.active[j.worker] = ver.id;
         c.secrets[j.worker] = ver.secrets;
+        (c.history = c.history || {})[j.worker] = [ver.id, ...(c.history[j.worker] || [])];
         return send(200, { success: true });
       }
       return send(404, { success: false });

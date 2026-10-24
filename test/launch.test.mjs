@@ -241,14 +241,12 @@ test('token expiry inside 14 days is a warning', async () => {
   assert.match(r.shown, /::warning::token CLOUDFLARE_API_TOKEN: expires/);
 });
 
-test('live and rollback are refused with the piece they belong to', async () => {
-  for (const [mode, piece] of [['live', 'piece 3'], ['rollback', 'piece 3']]) {
-    const before = fakes.state.requests.length;
-    const r = await launch(mode);
-    assert.equal(r.code, 2);
-    assert.match(r.shown, new RegExp(`mode "${mode}" is not built yet: it arrives with ${piece}`));
-    assert.equal(fakes.state.requests.length, before, `${mode} made no call at all`);
-  }
+test('live without the live key stops before any call', async () => {
+  const before = fakes.state.requests.length;
+  const r = await launch('live');
+  assert.equal(r.code, 2);
+  assert.match(r.shown, /missing environment values: STRIPE_LIVE_KEY/);
+  assert.equal(fakes.state.requests.length, before, 'live made no call at all');
 });
 
 test('a live Stripe key is refused before any call', async () => {
